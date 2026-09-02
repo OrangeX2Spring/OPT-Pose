@@ -222,11 +222,21 @@ class Aggregator(nn.Module):
             if hasattr(self.patch_embed, "mask_token"):
                 self.patch_embed.mask_token.requires_grad_(False)
 
-    def forward(self, images: torch.Tensor, masks: Optional[torch.Tensor] = None) -> Tuple[List[torch.Tensor], int]:
+    def forward(
+        self,
+        images: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+        num_ref_frames: Optional[int] = None,
+    ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            num_ref_frames (int, optional): If set, global attention becomes a causal
+                readout: frames [0, num_ref_frames) form the reference (cache) block and
+                do not see the query frame, while the query frame attends to everything.
+                Must equal S - 1 -- exactly one query frame, and it must be last.
+                Frame attention is untouched; it is per-frame already. Inference only.
 
         Returns:
             (list[torch.Tensor], int):
@@ -237,6 +247,13 @@ class Aggregator(nn.Module):
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        if num_ref_frames is not None:
+            assert not self.training, "num_ref_frames is an inference-only readout"
+            assert num_ref_frames == S - 1, (
+                f"num_ref_frames={num_ref_frames} requires S={num_ref_frames + 1}, got S={S}. "
+                "The readout supports exactly one query frame, placed last."
+            )
 
         # Normalize images and reshape for patch embed
         images = (images - self._resnet_mean) / self._resnet_std
@@ -287,6 +304,10 @@ class Aggregator(nn.Module):
         # update P because we added special tokens
         _, P, C = tokens.shape
 
+        # Global attention flattens to (B, S*P, C), so frames are contiguous blocks and
+        # the reference block is simply the first num_ref_frames * P tokens.
+        num_ref_tokens = None if num_ref_frames is None else num_ref_frames * P
+
         frame_idx = 0
         global_idx = 0
         output_list = []
@@ -299,7 +320,7 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos
+                        tokens, B, S, P, C, global_idx, pos=pos, num_ref_tokens=num_ref_tokens
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -338,7 +359,7 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, num_ref_tokens=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -353,9 +374,10 @@ class Aggregator(nn.Module):
         # by default, self.aa_block_size=1, which processes one block at a time
         for _ in range(self.aa_block_size):
             if self.training:
+                assert num_ref_tokens is None, "num_ref_tokens is an inference-only readout"
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos)
+                tokens = self.global_blocks[global_idx](tokens, pos=pos, num_ref_tokens=num_ref_tokens)
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 

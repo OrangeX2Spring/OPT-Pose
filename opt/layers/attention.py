@@ -15,6 +15,7 @@ import logging
 import os
 import warnings
 
+import torch
 from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
@@ -51,7 +52,14 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, num_ref_tokens=None) -> Tensor:
+        """
+        num_ref_tokens: enables the KV-Tracker-style causal readout. The first
+        `num_ref_tokens` positions are the reference (cache) block and attend only
+        among themselves; the remaining positions are the single query block and
+        attend to [reference, query]. Equivalent to a block attention mask, but
+        keeps the fused kernels. Inference only.
+        """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
@@ -62,8 +70,17 @@ class Attention(nn.Module):
             k = self.rope(k, pos)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+            if num_ref_tokens is None:
+                x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
+            else:
+                assert not self.training, "num_ref_tokens is an inference-only readout"
+                assert 0 < num_ref_tokens < N, f"num_ref_tokens={num_ref_tokens} not in (0, {N})"
+                n = num_ref_tokens
+                x_ref = F.scaled_dot_product_attention(q[:, :, :n], k[:, :, :n], v[:, :, :n])
+                x_qry = F.scaled_dot_product_attention(q[:, :, n:], k, v)
+                x = torch.cat([x_ref, x_qry], dim=2)
         else:
+            assert num_ref_tokens is None, "num_ref_tokens requires fused_attn"
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
             attn = attn.softmax(dim=-1)

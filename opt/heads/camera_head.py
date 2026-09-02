@@ -74,7 +74,7 @@ class CameraHead(nn.Module):
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
         self.pose_branch = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.target_dim, drop=0)
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4) -> list:
+    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4, num_ref_frames: int = None) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -93,10 +93,10 @@ class CameraHead(nn.Module):
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
 
-        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations)
+        pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations, num_ref_frames=num_ref_frames)
         return pred_pose_enc_list
 
-    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int) -> list:
+    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int, num_ref_frames: int = None) -> list:
         """
         Iteratively refine camera pose predictions.
 
@@ -110,6 +110,13 @@ class CameraHead(nn.Module):
         B, S, C = pose_tokens.shape
         pred_pose_enc = None
         pred_pose_enc_list = []
+
+        # The trunk is self-attention over the S camera tokens -- one token per frame --
+        # so it is a second cross-frame path and needs the same readout gating as the
+        # aggregator, otherwise the reference frames' pose_enc still sees the query frame.
+        assert num_ref_frames is None or num_ref_frames == S - 1, (
+            f"num_ref_frames={num_ref_frames} requires S={num_ref_frames + 1}, got S={S}"
+        )
 
         for _ in range(num_iterations):
             # Use a learned empty pose for the first iteration.
@@ -127,7 +134,10 @@ class CameraHead(nn.Module):
             pose_tokens_modulated = gate_msa * modulate(self.adaln_norm(pose_tokens), shift_msa, scale_msa)
             pose_tokens_modulated = pose_tokens_modulated + pose_tokens
 
-            pose_tokens_modulated = self.trunk(pose_tokens_modulated)
+            # Iterating nn.Sequential instead of calling it, so num_ref_frames reaches
+            # each Block. Module order and state_dict keys are unchanged.
+            for blk in self.trunk:
+                pose_tokens_modulated = blk(pose_tokens_modulated, num_ref_tokens=num_ref_frames)
             # Compute the delta update for the pose encoding.
             pred_pose_enc_delta = self.pose_branch(self.trunk_norm(pose_tokens_modulated))
 

@@ -78,9 +78,11 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, num_ref_tokens=None) -> Tensor:
+        # num_ref_tokens is forwarded to the attention; the MLP, LayerNorms and
+        # residuals are token-wise, so nothing else needs to know about the split.
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            return self.ls1(self.attn(self.norm1(x), pos=pos))
+            return self.ls1(self.attn(self.norm1(x), pos=pos, num_ref_tokens=num_ref_tokens))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))

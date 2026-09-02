@@ -500,13 +500,22 @@ class CrossFrameAttention(nn.Module):
         theta = pos.unsqueeze(1) / (10000 ** (2 * i / dim)).unsqueeze(0)
         return torch.cat([theta.sin(), theta.cos()], dim=-1)  # [S, dim]
 
-    def forward(self, x: torch.Tensor, B: int, S: int, K: int) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, B: int, S: int, K: int, num_ref_frames: int = None) -> torch.Tensor:
         x = x.reshape(B, S * K, -1)
         frame_emb = self._frame_embed(S, x.shape[-1], x.device)  # [S, dim]
         frame_emb = frame_emb.repeat_interleave(K, dim=0).unsqueeze(0)  # [1, S*K, dim]
         x = x + self.embed_scale * frame_emb
+        if num_ref_frames is None:
+            src_mask = None
+        else:
+            assert num_ref_frames == S - 1, f"num_ref_frames={num_ref_frames}, S={S}"
+            # nn.MultiheadAttention bool masks are inverted w.r.t. SDPA:
+            # True means "not allowed to attend". Reference keypoints must not
+            # see the query frame; the query frame sees everything.
+            src_mask = torch.zeros(S * K, S * K, dtype=torch.bool, device=x.device)
+            src_mask[: num_ref_frames * K, num_ref_frames * K :] = True
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, src_mask=src_mask)
         return x.reshape(B * S, K, -1)
 
 
@@ -562,7 +571,8 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 choose_indices: torch.Tensor = None, nocs_gt: torch.Tensor = None,
                 depth_sensor: torch.Tensor = None, category_names: list = None,
                 intrinsics: torch.Tensor = None, crop_boxes: torch.Tensor = None,
-                masks: torch.Tensor = None, use_gt_intrinsics: bool = False):
+                masks: torch.Tensor = None, use_gt_intrinsics: bool = False,
+                num_ref_frames: int = None):
         """
         Forward pass of the OPT model.
 
@@ -599,6 +609,19 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 Expected shape [B, S, H, W] (or [B, S, 1, H, W]).
                 If provided, masked pixels are replaced by a learned mask token before patch embedding.
                 Default: None
+            num_ref_frames (int, optional): Causal readout, KV-Tracker style. When set,
+                frames [0, num_ref_frames) are the reference (cache) block and frame
+                num_ref_frames is the single query frame, which must be last. Every path
+                that would otherwise write query-frame information back into a reference
+                frame's output is gated: global attention (aggregator), the camera-head
+                trunk, the pointmap center, the cross-frame keypoint attention and the
+                z_obj pooling. Consequence and go/no-go test: with num_ref_frames = n,
+                the outputs for frames [0, n) must match a plain forward over those n
+                frames alone, up to floating-point tolerance (the split changes the SDPA
+                kernel, so not bit equality). The pose head is deliberately NOT gated -- with
+                multi_view_aggregation it emits a single object->frame-0 pose for the
+                whole set, which is what a readout is supposed to produce, and it is not
+                a per-reference-frame output. Inference only. Default: None
 
         Returns:
             dict: A dictionary containing the following predictions:
@@ -629,14 +652,21 @@ class OPT(nn.Module, PyTorchModelHubMixin):
         if query_points is not None and len(query_points.shape) == 2:
             query_points = query_points.unsqueeze(0)
 
-        aggregated_tokens_list, patch_start_idx = self.aggregator(images, masks=masks)
+        assert num_ref_frames is None or num_ref_frames == images.shape[1] - 1, (
+            f"num_ref_frames={num_ref_frames} requires S={num_ref_frames + 1}, "
+            f"got S={images.shape[1]}"
+        )
+
+        aggregated_tokens_list, patch_start_idx = self.aggregator(
+            images, masks=masks, num_ref_frames=num_ref_frames
+        )
 
         predictions = {}
 
         with torch.amp.autocast("cuda", enabled=False):
             pose_enc_for_projection = None
             if self.camera_head is not None:
-                pose_enc_list = self.camera_head(aggregated_tokens_list)
+                pose_enc_list = self.camera_head(aggregated_tokens_list, num_ref_frames=num_ref_frames)
                 pose_enc_for_projection = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
                 if intrinsics is not None:
@@ -684,7 +714,10 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                     predictions["pts_3d_pm"] = pts_3d_pm
                     # Unified center across all S frames (pointmap is in frame-0 space)
                     B_pm, S_pm = pts_3d_pm.shape[:2]
-                    center_pm = pts_3d_pm.mean(dim=(1, 2), keepdim=True)  # [B, 1, 1, 3]
+                    # The center is shared by every frame, so averaging over the query
+                    # frame too would push its geometry into the reference frames' output.
+                    n_ref_pm = S_pm if num_ref_frames is None else num_ref_frames
+                    center_pm = pts_3d_pm[:, :n_ref_pm].mean(dim=(1, 2), keepdim=True)  # [B, 1, 1, 3]
                     predictions['center_pm'] = center_pm.expand(-1, S_pm, -1, -1).contiguous()  # [B, S, 1, 3]
                     predictions["pts_3d_pm_c"] = predictions["pts_3d_pm"] - predictions['center_pm']
 
@@ -740,7 +773,7 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 # exchange information before NOCS prediction (no-op when S=1).
                 if self.cross_frame_nocs_attn:
                     kpt_feature_flat = self.cross_frame_attn(
-                        kpt_feature_flat, B, S, self.kpt_num,
+                        kpt_feature_flat, B, S, self.kpt_num, num_ref_frames=num_ref_frames,
                     )  # [BS, kpt_num, 256]
 
                 # Object embedding from keypoint features.
@@ -750,7 +783,8 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 # across all S frames (identity when S=1).
                 if self.cross_frame_z_obj:
                     z_obj_seq = z_obj_flat.view(B, S, -1)
-                    z_obj_mean = z_obj_seq.mean(dim=1, keepdim=True)          # [B, 1, 256]
+                    n_ref_z = S if num_ref_frames is None else num_ref_frames
+                    z_obj_mean = z_obj_seq[:, :n_ref_z].mean(dim=1, keepdim=True)  # [B, 1, 256]
                     z_obj_flat = z_obj_mean.expand(B, S, -1).reshape(BS, -1)  # [BS, 256]
 
                 # Predict NOCS using FiLM conditioning on the fused representation
