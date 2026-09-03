@@ -17,15 +17,27 @@ comparison):
   B'  causal readout over frames [0, n) + {n+1}                same, other query
   C   bidirectional over frames [0, n]                         drift baseline
 
-  REPEAT      B[:, :n]  vs  B*[:, :n]. Same values and same shapes, but built as
-              a SEPARATE tensor, exactly the way B' is -- which is what makes it
-              a floor LEAK can be read against. Handing B and B* the identical
-              tensor instead measures nothing at all: it returned exactly
-              0.000e+00 on every deterministic key, while B', running on a
-              freshly built tensor of the same shape, sat at ~3e-6. The gate then
-              failed on all ten sequences against a floor that no pass could
-              reach, because REPEAT and LEAK differed in two things (memory and
-              content) while being compared as if they differed in one.
+  REPEAT      B[:, :n]  vs  B*[:, :n], maximised over --num_repeats draws. Same
+              values and same shapes as B, but built as a SEPARATE tensor exactly
+              the way B' is, which is what makes it a floor LEAK can be read
+              against. Two things make it a distribution rather than a constant,
+              and both were learned the hard way:
+
+              Handing B and B* the identical tensor measures nothing at all -- it
+              returned exactly 0.000e+00 on every deterministic key while B', on
+              a freshly built tensor of the same shape, sat at ~3e-6, so the gate
+              failed on all ten sequences against an unreachable floor. REPEAT and
+              LEAK have to differ in content and in nothing else.
+
+              And once they do, the deterministic keys (depth, pose_enc,
+              world_points) go to exactly 0.000e+00 for REPEAT and LEAK alike,
+              while everything downstream of sonata sits at ~1e-3 in BOTH: sonata's
+              scatter is nondeterministic on the GPU, so its floor is a random
+              variable. A single draw of REPEAT against a single draw of LEAK is
+              then a coin flip -- it failed 8 of 10 sequences with LEAK below
+              REPEAT on five of them, which is what two samples of one
+              distribution look like. Hence several draws, and the max as the
+              floor.
 
   LEAK        B[:, :n]  vs  B'[:, :n], where B' is the same readout with a
               DIFFERENT query frame appended. This is the gate, and it passes
@@ -203,6 +215,20 @@ def compare(a: torch.Tensor, b: torch.Tensor):
     return d, (d / scale if scale > 0 else float("nan"))
 
 
+def max_table(tables: list) -> dict:
+    """Per key, the largest difference seen across several compare tables.
+
+    Used to turn the repeat floor from one sample into the worst of several. The
+    keys downstream of sonata are nondeterministic on the GPU at ~1e-3, so a
+    one-sample floor is not a threshold, it is a coin flip.
+    """
+    assert tables, "no repeat draws to maximise over"
+    return {
+        k: (max(t[k][0] for t in tables), max(t[k][1] for t in tables))
+        for k in tables[0]
+    }
+
+
 def compare_frames(left: dict, right: dict, frame_slice: slice) -> dict:
     out = {}
     keys = sorted(set(left) & set(right))
@@ -231,6 +257,10 @@ def main():
                         help="LEAK pass threshold. Zero on purpose: B and B' differ only in the "
                              "query frame's content, at identical shapes, so a correctly gated "
                              "readout reproduces the reference frames bit for bit")
+    parser.add_argument("--num_repeats", type=int, default=3,
+                        help="repeat draws of pass B used to estimate the LEAK floor. "
+                             "Anything downstream of sonata has a stochastic floor, so one "
+                             "draw is not a threshold.")
     parser.add_argument("--seed", type=int, default=0,
                         help="numpy seed set before every forward, so sonata's train-mode "
                              "GridSample picks the same voxel representatives in each pass")
@@ -281,7 +311,8 @@ def main():
         # All three readout passes are constructed identically, so the only thing
         # that varies across them is the query frame's content. See select_query.
         inp_b = select_query(inp, args.num_ref, args.num_ref)
-        inp_rep = select_query(inp, args.num_ref, args.num_ref)
+        inp_reps = [select_query(inp, args.num_ref, args.num_ref)
+                    for _ in range(args.num_repeats)]
         inp_alt = select_query(inp, args.num_ref, args.num_ref + 1)
         # The premise the whole gate rests on: B and B' agree on the reference block.
         assert torch.equal(inp_b["images"][:, : args.num_ref],
@@ -289,13 +320,18 @@ def main():
 
         a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed)
         b = forward(model, inp_b, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
-        # B* before B', so the floor is measured one call downstream of B -- the
-        # same position B' occupies relative to the allocator.
-        b_rep = forward(model, inp_rep, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        # The repeats come before B', so the floor is drawn from the same stretch of
+        # allocator history that B' occupies. Compared and dropped one at a time --
+        # holding every prediction dict would be pointless memory.
+        rep_tables = []
+        for inp_rep in inp_reps:
+            b_rep = forward(model, inp_rep, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+            rep_tables.append(compare_frames(b, b_rep, slice(0, args.num_ref)))
+            del b_rep
         b_alt = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
         c = forward(model, inp_b, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
 
-        repeat = compare_frames(b, b_rep, slice(0, args.num_ref))
+        repeat = max_table(rep_tables)
         leak = compare_frames(b, b_alt, slice(0, args.num_ref))
         selfcheck = compare_frames(a, b, slice(0, args.num_ref))
         drift = compare_frames(c, b, slice(args.num_ref, seq_len))
@@ -337,6 +373,7 @@ def main():
         "num_seqs": len(records),
         "tol": args.tol,
         "tol_leak": args.tol_leak,
+        "num_repeats": args.num_repeats,
         "summary": summary,
         "per_sequence": records,
     }
@@ -352,8 +389,10 @@ def main():
     if leaking:
         print(f"LEAK FAILED on {len(leaking)} of {len(records)} sequences -- changing only the "
               "query frame's content moved the reference frames further than re-running the "
-              "identical computation does, so a cross-frame path is still ungated and the "
-              "DRIFT numbers are meaningless:")
+              f"same computation on fresh memory does, worst of {args.num_repeats} draws. Read it "
+              "per key: a key whose floor is 0.000e+00 is deterministic and any excess is a real "
+              "cross-frame path, while a key downstream of sonata has a stochastic floor and a "
+              "narrow excess there is a sampling artefact, not information:")
         for name, over in leaking:
             detail = "  ".join(f"{k}={l:.2e} vs floor {r:.2e}" for k, (l, r) in sorted(over.items()))
             print(f"  {name}: {detail}")
