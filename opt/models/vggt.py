@@ -614,8 +614,10 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 num_ref_frames is the single query frame, which must be last. Every path
                 that would otherwise write query-frame information back into a reference
                 frame's output is gated: global attention (aggregator), the camera-head
-                trunk, the pointmap center, the cross-frame keypoint attention and the
-                z_obj pooling. Consequence and go/no-go test: with num_ref_frames = n,
+                trunk, the pointmap center, the cross-frame keypoint attention, the
+                z_obj pooling, and the sonata point encoder -- whose extract() collates
+                every frame into one batch, and which is reached one level down rather
+                than being visible here. Consequence and go/no-go test: with num_ref_frames = n,
                 the outputs for frames [0, n) must match a plain forward over those n
                 frames alone, up to floating-point tolerance (the split changes the SDPA
                 kernel, so not bit equality). The pose head is deliberately NOT gated -- with
@@ -747,8 +749,25 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 
                 colors_input = predictions.get("color", None)                 # [B,S,K,3] or None
                 normals_input = predictions.get("normal", None)               # [B,S,K,3] or None
-                sonata_feat = self.sonata_backbone.extract(pts_3d_input, colors_input, normals_input
-                )  # [B,S,K,1088]
+                if num_ref_frames is None:
+                    sonata_feat = self.sonata_backbone.extract(pts_3d_input, colors_input, normals_input
+                    )  # [B,S,K,1088]
+                else:
+                    # Seventh cross-frame path, and the one the six-path analysis missed
+                    # because it is a level down inside SonataBackbone.extract rather than
+                    # visible in this function: extract collates all B*S frames into ONE
+                    # sonata batch, so a reference frame's features depend on which other
+                    # frames travel with it. Splitting the call is also what a KV cache
+                    # does -- the reference block is encoded once, the query frame alone.
+                    n = num_ref_frames
+                    col_ref = None if colors_input is None else colors_input[:, :n]
+                    col_qry = None if colors_input is None else colors_input[:, n:]
+                    nrm_ref = None if normals_input is None else normals_input[:, :n]
+                    nrm_qry = None if normals_input is None else normals_input[:, n:]
+                    sonata_feat = torch.cat([
+                        self.sonata_backbone.extract(pts_3d_input[:, :n], col_ref, nrm_ref),
+                        self.sonata_backbone.extract(pts_3d_input[:, n:], col_qry, nrm_qry),
+                    ], dim=1)  # [B,S,K,1088]
 
                 pts_local = sonata_feat.view(BS, K, 1088)       # [BS,K,1088]
                 pts_local = pts_local.transpose(1, 2)           # [BS,1088,K]
