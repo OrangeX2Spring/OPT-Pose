@@ -17,12 +17,15 @@ comparison):
   B'  causal readout over frames [0, n) + {n+1}                same, other query
   C   bidirectional over frames [0, n]                         drift baseline
 
-  REPEAT      B[:, :n]  vs  B*[:, :n]. Identical inputs, identical shapes, so
-              this is what the machine does to an unchanged computation --
-              nonzero because the caching allocator hands out different
-              addresses on the second call and kernel selection is alignment
-              sensitive. Measured rather than assumed, because it is the floor
-              LEAK has to be read against.
+  REPEAT      B[:, :n]  vs  B*[:, :n]. Same values and same shapes, but built as
+              a SEPARATE tensor, exactly the way B' is -- which is what makes it
+              a floor LEAK can be read against. Handing B and B* the identical
+              tensor instead measures nothing at all: it returned exactly
+              0.000e+00 on every deterministic key, while B', running on a
+              freshly built tensor of the same shape, sat at ~3e-6. The gate then
+              failed on all ten sequences against a floor that no pass could
+              reach, because REPEAT and LEAK differed in two things (memory and
+              content) while being compared as if they differed in one.
 
   LEAK        B[:, :n]  vs  B'[:, :n], where B' is the same readout with a
               DIFFERENT query frame appended. This is the gate, and it passes
@@ -148,17 +151,20 @@ def build_inputs(batch: dict, seq_len: int, device: str, use_gt_intrinsics: bool
     }
 
 
-def swap_query(inp: dict, n: int) -> dict:
-    """Replace frame n with frame n+1, leaving frames [0, n) untouched.
+def select_query(inp: dict, n: int, q_idx: int) -> dict:
+    """Frames [0, n) followed by frame q_idx, as a freshly allocated tensor.
 
-    Gives pass B' a different query frame at identical shapes, so the GEMM tiling
-    that sets the numerical floor is the same in B and B' and cancels in the
-    comparison. Only entries carrying a frame axis are reindexed; cat_labels is
-    [B] and use_gt_intrinsics is a bool.
+    Every readout pass is built through this, including the ones whose query frame
+    is frame n, so that B, B* and B' differ in the query frame's CONTENT and in
+    nothing else. Slicing `inp` for B while B' came out of a torch.cat was enough
+    to break the gate: B and B* then shared one tensor at one address and REPEAT
+    was a replay of the identical computation, exactly 0, while B' ran on separate
+    memory. Only entries carrying a frame axis are reindexed; cat_labels is [B]
+    and use_gt_intrinsics is a bool.
     """
     return {
-        k: torch.cat([v[:, :n], v[:, n + 1:n + 2]], dim=1)
-        if torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] >= n + 2 else v
+        k: torch.cat([v[:, :n], v[:, q_idx:q_idx + 1]], dim=1)
+        if torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] >= q_idx + 1 else v
         for k, v in inp.items()
     }
 
@@ -272,15 +278,22 @@ def main():
             continue
 
         inp = build_inputs(batch, window, device, args.use_gt_intrinsics)
-        inp_alt = swap_query(inp, args.num_ref)
+        # All three readout passes are constructed identically, so the only thing
+        # that varies across them is the query frame's content. See select_query.
+        inp_b = select_query(inp, args.num_ref, args.num_ref)
+        inp_rep = select_query(inp, args.num_ref, args.num_ref)
+        inp_alt = select_query(inp, args.num_ref, args.num_ref + 1)
+        # The premise the whole gate rests on: B and B' agree on the reference block.
+        assert torch.equal(inp_b["images"][:, : args.num_ref],
+                           inp_alt["images"][:, : args.num_ref]), "reference frames differ"
 
         a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed)
-        b = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
-        # B* before B', so the noise floor is measured one call downstream of B --
-        # the same position B' occupies relative to the allocator.
-        b_rep = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        b = forward(model, inp_b, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        # B* before B', so the floor is measured one call downstream of B -- the
+        # same position B' occupies relative to the allocator.
+        b_rep = forward(model, inp_rep, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
         b_alt = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
-        c = forward(model, inp, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
+        c = forward(model, inp_b, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
 
         repeat = compare_frames(b, b_rep, slice(0, args.num_ref))
         leak = compare_frames(b, b_alt, slice(0, args.num_ref))
