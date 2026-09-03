@@ -81,7 +81,13 @@ class Block(nn.Module):
     def forward(self, x: Tensor, pos=None, num_ref_tokens=None) -> Tensor:
         # num_ref_tokens is forwarded to the attention; the MLP, LayerNorms and
         # residuals are token-wise, so nothing else needs to know about the split.
+        # Forwarded only when set: NestedTensorBlock subclasses this and delegates
+        # tensor input to it, and its MemEffAttention takes no num_ref_tokens. That
+        # block is the DINOv2 patch embedder, which is per-frame and never carries a
+        # readout split, so passing it unconditionally broke a plain forward.
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
+            if num_ref_tokens is None:
+                return self.ls1(self.attn(self.norm1(x), pos=pos))
             return self.ls1(self.attn(self.norm1(x), pos=pos, num_ref_tokens=num_ref_tokens))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
