@@ -6,23 +6,30 @@
 Step 0 of the causal-readout experiment: does OPT-Pose survive one-directional
 (KV-Tracker style) attention without retraining?
 
-Three measurements per object sequence, four forwards over the SAME preloaded
+Four measurements per object sequence, five forwards over the SAME preloaded
 window of n+2 frames (the batch is built once and reused, so dataset sampling
 randomness -- choose_indices, resize augmentation -- cannot leak into the
 comparison):
 
   A   bidirectional over frames [0, n)                         reference values
   B   causal readout over frames [0, n], num_ref_frames = n    the thing under test
+  B*  B again, byte-identical inputs                           the noise floor
   B'  causal readout over frames [0, n) + {n+1}                same, other query
   C   bidirectional over frames [0, n]                         drift baseline
 
+  REPEAT      B[:, :n]  vs  B*[:, :n]. Identical inputs, identical shapes, so
+              this is what the machine does to an unchanged computation --
+              nonzero because the caching allocator hands out different
+              addresses on the second call and kernel selection is alignment
+              sensitive. Measured rather than assumed, because it is the floor
+              LEAK has to be read against.
+
   LEAK        B[:, :n]  vs  B'[:, :n], where B' is the same readout with a
-              DIFFERENT query frame appended. This is the gate. Shapes are
-              identical between B and B', so every GEMM tiles the same way and
-              the numerical floor cancels exactly; the only thing that differs
-              is the query frame's content. Any non-zero value is information
-              flowing from the query frame into the cache, i.e. an ungated
-              cross-frame path. It must be exactly 0.
+              DIFFERENT query frame appended. This is the gate, and it passes
+              when LEAK <= REPEAT: shapes are identical between B and B', so the
+              only thing that differs beyond allocator noise is the query
+              frame's content. LEAK above REPEAT is information flowing from the
+              query frame into the cache, i.e. an ungated cross-frame path.
 
   SELFCHECK   A  vs  B[:, :n]. Reported, not gated. It cannot be zero: pass B
               runs the projections over (n+1)*P tokens instead of n*P, which
@@ -44,10 +51,12 @@ head is left ungated on purpose (see OPT.forward's num_ref_frames docstring), so
 its output is not comparable between A and B by construction. nocs and
 pred_kpt_3d, which are what the pose head consumes, are compared instead.
 
-Residual non-determinism, two sources, neither of which LEAK is exposed to.
-SDPA/cuDNN kernel selection and GEMM tiling differ between an n-frame and an
-(n+1)-frame forward, which is what keeps SELFCHECK off zero. Larger by three
-orders: sonata's GridSample runs in mode="train", keeping one RANDOM point per voxel
+Residual non-determinism, three sources. SDPA/cuDNN kernel selection and GEMM
+tiling differ between an n-frame and an (n+1)-frame forward, which is what keeps
+SELFCHECK off zero; LEAK is not exposed to that one, since B and B' share every
+shape. Allocator addresses differ between any two calls and kernel selection is
+alignment sensitive, which is what REPEAT measures and LEAK is judged against.
+Larger by three orders: sonata's GridSample runs in mode="train", keeping one RANDOM point per voxel
 (np.random.randint), so every call to SonataBackbone.extract resamples the point
 cloud. Everything downstream of it -- nocs, pred_kpt_3d, z_obj -- is affected.
 Each forward therefore reseeds numpy: extract transforms frames in order, so
@@ -247,7 +256,7 @@ def main():
           f"alternative query = frame {args.start + seq_len}")
 
     records = []
-    worst_leak = 0.0
+    leaking = []
     for name in names:
         entries = ds.chunks[name]
         if len(entries) < args.start + window:
@@ -267,26 +276,38 @@ def main():
 
         a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed)
         b = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
-        b2 = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        # B* before B', so the noise floor is measured one call downstream of B --
+        # the same position B' occupies relative to the allocator.
+        b_rep = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        b_alt = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
         c = forward(model, inp, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
 
-        leak = compare_frames(b, b2, slice(0, args.num_ref))
+        repeat = compare_frames(b, b_rep, slice(0, args.num_ref))
+        leak = compare_frames(b, b_alt, slice(0, args.num_ref))
         selfcheck = compare_frames(a, b, slice(0, args.num_ref))
         drift = compare_frames(c, b, slice(args.num_ref, seq_len))
 
-        worst_leak = max(worst_leak, max(v[0] for v in leak.values()))
+        # Per key, against that key's own floor: the amplification through
+        # GridSample is three orders larger for nocs than for depth, so one
+        # scalar threshold across keys would be meaningless.
+        over = {k: (leak[k][0], repeat[k][0]) for k in leak if leak[k][0] > repeat[k][0]}
+        if over:
+            leaking.append((name, over))
 
         print(f"--- {name}")
+        print(f"    REPEAT    {fmt(repeat)}")
         print(f"    LEAK      {fmt(leak)}")
         print(f"    SELFCHECK {fmt(selfcheck)}")
         print(f"    DRIFT     {fmt(drift)}")
-        records.append({"seq_name": name, "ids": ids,
+        if over:
+            print(f"    ^^ LEAK over REPEAT on: {', '.join(sorted(over))}")
+        records.append({"seq_name": name, "ids": ids, "repeat": repeat,
                         "leak": leak, "selfcheck": selfcheck, "drift": drift})
 
     assert records, "every sequence was skipped"
 
     summary = {}
-    for stage in ("leak", "selfcheck", "drift"):
+    for stage in ("repeat", "leak", "selfcheck", "drift"):
         keys = sorted(records[0][stage])
         summary[stage] = {
             k: {
@@ -310,19 +331,24 @@ def main():
         json.dump(result, f, indent=2)
 
     print("\n=== summary over", len(records), "sequences ===")
-    for stage in ("leak", "selfcheck", "drift"):
+    for stage in ("repeat", "leak", "selfcheck", "drift"):
         for k, v in summary[stage].items():
             print(f"{stage:9s} {k:18s} max_abs={v['max_abs']:.3e}  max_rel={v['max_rel']:.2%}")
     print(f"\nwrote {args.out}")
 
-    if worst_leak > args.tol_leak:
-        print(f"LEAK FAILED: {worst_leak:.3e} > {args.tol_leak:.1e} -- the reference frames "
-              "moved when only the query frame's content changed, so a cross-frame path is "
-              "still ungated and the DRIFT numbers are meaningless")
+    if leaking:
+        print(f"LEAK FAILED on {len(leaking)} of {len(records)} sequences -- changing only the "
+              "query frame's content moved the reference frames further than re-running the "
+              "identical computation does, so a cross-frame path is still ungated and the "
+              "DRIFT numbers are meaningless:")
+        for name, over in leaking:
+            detail = "  ".join(f"{k}={l:.2e} vs floor {r:.2e}" for k, (l, r) in sorted(over.items()))
+            print(f"  {name}: {detail}")
         sys.exit(1)
-    print(f"LEAK OK: {worst_leak:.3e} <= {args.tol_leak:.1e} -- no query-frame information "
-          "reaches the reference block. Any SELFCHECK residual above this is the GEMM-shape "
-          "floor amplified by GridSample, not a gating failure.")
+    print(f"LEAK OK on all {len(records)} sequences: every key is at or below its own "
+          "repeat-run floor, so no query-frame information reaches the reference block. "
+          "SELFCHECK above that floor is the GEMM-shape difference between an n-frame and "
+          "an (n+1)-frame forward, amplified by GridSample -- not a gating failure.")
 
 
 if __name__ == "__main__":
