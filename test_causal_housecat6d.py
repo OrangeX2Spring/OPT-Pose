@@ -31,9 +31,15 @@ head is left ungated on purpose (see OPT.forward's num_ref_frames docstring), so
 its output is not comparable between A and B by construction. nocs and
 pred_kpt_3d, which are what the pose head consumes, are compared instead.
 
-Residual non-determinism: SDPA/cuDNN kernel selection can differ between the
-one-call and two-call attention paths, so the selfcheck threshold is a tolerance
-(--tol, fp32 default 1e-4), not bit equality.
+Residual non-determinism, two sources. SDPA/cuDNN kernel selection can differ
+between the one-call and two-call attention paths, so the selfcheck threshold is
+a tolerance (--tol, fp32 default 1e-4), not bit equality. Larger by three orders:
+sonata's GridSample runs in mode="train", which keeps one RANDOM point per voxel
+(np.random.randint), so every call to SonataBackbone.extract resamples the point
+cloud. Everything downstream of it -- nocs, pred_kpt_3d, z_obj -- is affected.
+Each forward therefore reseeds numpy: extract transforms frames in order, so
+frames [0, n) draw identically across passes and the query frame's draws land
+after them. This changes no model behaviour, only the RNG state at entry.
 
 Usage (see tools/opt_pose_causal.sbatch, this is not meant to be run by hand):
 
@@ -120,8 +126,12 @@ def build_inputs(batch: dict, seq_len: int, device: str, use_gt_intrinsics: bool
     }
 
 
-def forward(model: torch.nn.Module, inp: dict, num_frames: int, num_ref_frames):
-    """One forward over the first num_frames frames, keeping only COMPARE_KEYS on CPU."""
+def forward(model: torch.nn.Module, inp: dict, num_frames: int, num_ref_frames, seed: int):
+    """One forward over the first num_frames frames, keeping only COMPARE_KEYS on CPU.
+
+    Reseeds numpy first; see the module docstring on sonata's GridSample.
+    """
+    np.random.seed(seed)
     with torch.inference_mode():
         preds = model(
             images=inp["images"][:, :num_frames],
@@ -173,6 +183,9 @@ def main():
     parser.add_argument("--num_seqs", type=int, default=10, help="object sequences to evaluate")
     parser.add_argument("--start", type=int, default=0, help="first frame index of the window")
     parser.add_argument("--tol", type=float, default=1e-4, help="selfcheck pass threshold")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="numpy seed set before every forward, so sonata's train-mode "
+                             "GridSample picks the same voxel representatives in each pass")
     parser.add_argument("--use_gt_intrinsics", action="store_true")
     parser.add_argument("--out", type=str, required=True, help="results json")
     args = parser.parse_args()
@@ -214,9 +227,9 @@ def main():
 
         inp = build_inputs(batch, seq_len, device, args.use_gt_intrinsics)
 
-        a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None)
-        b = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref)
-        c = forward(model, inp, num_frames=seq_len, num_ref_frames=None)
+        a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed)
+        b = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        c = forward(model, inp, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
 
         selfcheck = compare_frames(a, b, slice(0, args.num_ref))
         drift = compare_frames(c, b, slice(args.num_ref, seq_len))
