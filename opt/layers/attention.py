@@ -76,7 +76,17 @@ class Attention(nn.Module):
                 assert not self.training, "num_ref_tokens is an inference-only readout"
                 assert 0 < num_ref_tokens < N, f"num_ref_tokens={num_ref_tokens} not in (0, {N})"
                 n = num_ref_tokens
-                x_ref = F.scaled_dot_product_attention(q[:, :, :n], k[:, :, :n], v[:, :, :n])
+                # The reference slices are made contiguous so this call matches, layout and
+                # all, the one a plain n-frame forward issues: a slice along dim 2 of
+                # [B, H, N, D] is non-contiguous and SDPA can pick a different kernel for
+                # it. The resulting ~1e-6 drift is not harmless downstream -- sonata's
+                # GridSample does np.floor(coord / 0.004), so a point within 1e-6 of a
+                # voxel boundary flips voxel, which changes count.size, which re-keys
+                # np.random.randint(0, count.max(), count.size) % count for every voxel at
+                # once. Three orders of amplification, and object-dependent.
+                x_ref = F.scaled_dot_product_attention(
+                    q[:, :, :n].contiguous(), k[:, :, :n].contiguous(), v[:, :, :n].contiguous()
+                )
                 x_qry = F.scaled_dot_product_attention(q[:, :, n:], k, v)
                 x = torch.cat([x_ref, x_qry], dim=2)
         else:
