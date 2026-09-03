@@ -7,15 +7,25 @@ Step 0 of the causal-readout experiment: does OPT-Pose survive one-directional
 (KV-Tracker style) attention without retraining?
 
 Four measurements per object sequence, five forwards over the SAME preloaded
-window of n+2 frames (the batch is built once and reused, so dataset sampling
+window of n+g+1 frames (the batch is built once and reused, so dataset sampling
 randomness -- choose_indices, resize augmentation -- cannot leak into the
-comparison):
+comparison). The reference block is frames [0, n); the query frame sits g frames
+after the last of them, at q = n-1+g, and B' uses q+1:
 
   A   bidirectional over frames [0, n)                         reference values
-  B   causal readout over frames [0, n], num_ref_frames = n    the thing under test
+  B   causal readout over frames [0, n) + {q}, num_ref = n     the thing under test
   B*  B again, byte-identical inputs                           the noise floor
-  B'  causal readout over frames [0, n) + {n+1}                same, other query
-  C   bidirectional over frames [0, n]                         drift baseline
+  B'  causal readout over frames [0, n) + {q+1}                same, other query
+  C   bidirectional over frames [0, n) + {q}                   drift baseline
+
+g = 1 is the adjacent case Step 0 measured. It is not the tracking regime: a real
+cache is read tens of frames after it was built, and whether the readout survives
+that separation is a different question from how large the cache is. Sweep the two
+axes independently -- g with --query_gap, cache size with --num_ref, and note that
+--start keeps the query frame FIXED while cache size varies (--num_ref 3 --start 0,
+--num_ref 2 --start 1, --num_ref 1 --start 2 all query absolute frame 3, with the
+references immediately preceding it), so the curve is not confounded by comparing
+drift on three different images.
 
   REPEAT      B[:, :n]  vs  B*[:, :n], maximised over --num_repeats draws. Same
               values and same shapes as B, but built as a SEPARATE tensor exactly
@@ -251,6 +261,11 @@ def main():
                              "num_ref+1 should stay <= 4 or frame count becomes a second shift")
     parser.add_argument("--num_seqs", type=int, default=10, help="object sequences to evaluate")
     parser.add_argument("--start", type=int, default=0, help="first frame index of the window")
+    parser.add_argument("--query_gap", type=int, default=1,
+                        help="frames from the last reference frame to the query frame; 1 is "
+                             "adjacent, which is what Step 0 measured. Widening it costs "
+                             "sequences: the loader needs num_ref+query_gap+1 frames per object, "
+                             "and short chunks are skipped rather than silently truncated")
     parser.add_argument("--tol", type=float, default=1e-4,
                         help="reporting threshold for SELFCHECK; not a gate (see module docstring)")
     parser.add_argument("--tol_leak", type=float, default=0.0,
@@ -268,10 +283,12 @@ def main():
     parser.add_argument("--out", type=str, required=True, help="results json")
     args = parser.parse_args()
 
-    seq_len = args.num_ref + 1
-    # One frame beyond the readout window, used only as the alternative query in
-    # pass B'. It never enters the reference block.
-    window = seq_len + 1
+    assert args.query_gap >= 1, "--query_gap 1 is the adjacent case; 0 would query a reference frame"
+    seq_len = args.num_ref + 1          # frames in one readout forward: the block plus one query
+    q_idx = args.num_ref - 1 + args.query_gap   # the query frame's position in the loaded window
+    # One frame beyond the query, used only as the alternative query in pass B'.
+    # It never enters the reference block.
+    window = q_idx + 2
     model, device = load_opt_model(checkpoint_path=args.checkpoint)
 
     common_conf = build_common_conf(img_size=518, patch_size=14)
@@ -289,7 +306,8 @@ def main():
     names = sorted(ds.seq_names)[: args.num_seqs]
     print(f"{len(ds.seq_names)} sequences available, evaluating {len(names)}, "
           f"window = frames [{args.start}, {args.start + window}), num_ref = {args.num_ref}, "
-          f"alternative query = frame {args.start + seq_len}")
+          f"query_gap = {args.query_gap}, query = frame {args.start + q_idx}, "
+          f"alternative query = frame {args.start + q_idx + 1}")
 
     records = []
     leaking = []
@@ -310,10 +328,10 @@ def main():
         inp = build_inputs(batch, window, device, args.use_gt_intrinsics)
         # All three readout passes are constructed identically, so the only thing
         # that varies across them is the query frame's content. See select_query.
-        inp_b = select_query(inp, args.num_ref, args.num_ref)
-        inp_reps = [select_query(inp, args.num_ref, args.num_ref)
+        inp_b = select_query(inp, args.num_ref, q_idx)
+        inp_reps = [select_query(inp, args.num_ref, q_idx)
                     for _ in range(args.num_repeats)]
-        inp_alt = select_query(inp, args.num_ref, args.num_ref + 1)
+        inp_alt = select_query(inp, args.num_ref, q_idx + 1)
         # The premise the whole gate rests on: B and B' agree on the reference block.
         assert torch.equal(inp_b["images"][:, : args.num_ref],
                            inp_alt["images"][:, : args.num_ref]), "reference frames differ"
@@ -370,6 +388,8 @@ def main():
         "num_ref": args.num_ref,
         "seq_len": seq_len,
         "start": args.start,
+        "query_gap": args.query_gap,
+        "query_index": args.start + q_idx,
         "num_seqs": len(records),
         "tol": args.tol,
         "tol_leak": args.tol_leak,
