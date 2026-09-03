@@ -6,21 +6,34 @@
 Step 0 of the causal-readout experiment: does OPT-Pose survive one-directional
 (KV-Tracker style) attention without retraining?
 
-Two measurements per object sequence, three forwards over the SAME preloaded
-frames (the batch is built once and reused, so dataset sampling randomness --
-choose_indices, resize augmentation -- cannot leak into the comparison):
+Three measurements per object sequence, four forwards over the SAME preloaded
+window of n+2 frames (the batch is built once and reused, so dataset sampling
+randomness -- choose_indices, resize augmentation -- cannot leak into the
+comparison):
 
-  A  bidirectional over frames [0, n)                          reference values
-  B  causal readout over frames [0, n], num_ref_frames = n      the thing under test
-  C  bidirectional over frames [0, n]                           drift baseline
+  A   bidirectional over frames [0, n)                         reference values
+  B   causal readout over frames [0, n], num_ref_frames = n    the thing under test
+  B'  causal readout over frames [0, n) + {n+1}                same, other query
+  C   bidirectional over frames [0, n]                         drift baseline
 
-  SELFCHECK   A  vs  B[:, :n]     must be ~0. This is the plumbing test: every
-              path that writes query-frame information back into a reference
-              frame's output has to be gated, otherwise reference outputs move
-              when a query frame is appended. It covers all five gated paths at
-              once (global attention, camera-head trunk, pointmap center,
-              cross-frame keypoint attention, z_obj pooling) and needs no
-              ground truth. Non-zero here means a bug, not a research result.
+  LEAK        B[:, :n]  vs  B'[:, :n], where B' is the same readout with a
+              DIFFERENT query frame appended. This is the gate. Shapes are
+              identical between B and B', so every GEMM tiles the same way and
+              the numerical floor cancels exactly; the only thing that differs
+              is the query frame's content. Any non-zero value is information
+              flowing from the query frame into the cache, i.e. an ungated
+              cross-frame path. It must be exactly 0.
+
+  SELFCHECK   A  vs  B[:, :n]. Reported, not gated. It cannot be zero: pass B
+              runs the projections over (n+1)*P tokens instead of n*P, which
+              changes the GEMM shapes and leaves ~1e-6 in the reference frames'
+              geometry no gating can remove. Downstream of sonata's GridSample
+              that is amplified by up to three orders -- np.floor(coord/0.004)
+              flips a near-boundary point into another voxel, count.size
+              changes, and idx_select is keyed on the voxel counts, so one flip
+              re-draws the representative of every voxel. The result is chaotic
+              in the object and worthless as a pass/fail criterion, which is why
+              LEAK exists. Read it as a sensitivity measurement instead.
 
   DRIFT       C[:, n]  vs  B[:, n]  on the query frame. This is the actual
               quantity of interest: how far the causal readout moves the
@@ -31,10 +44,10 @@ head is left ungated on purpose (see OPT.forward's num_ref_frames docstring), so
 its output is not comparable between A and B by construction. nocs and
 pred_kpt_3d, which are what the pose head consumes, are compared instead.
 
-Residual non-determinism, two sources. SDPA/cuDNN kernel selection can differ
-between the one-call and two-call attention paths, so the selfcheck threshold is
-a tolerance (--tol, fp32 default 1e-4), not bit equality. Larger by three orders:
-sonata's GridSample runs in mode="train", which keeps one RANDOM point per voxel
+Residual non-determinism, two sources, neither of which LEAK is exposed to.
+SDPA/cuDNN kernel selection and GEMM tiling differ between an n-frame and an
+(n+1)-frame forward, which is what keeps SELFCHECK off zero. Larger by three
+orders: sonata's GridSample runs in mode="train", keeping one RANDOM point per voxel
 (np.random.randint), so every call to SonataBackbone.extract resamples the point
 cloud. Everything downstream of it -- nocs, pred_kpt_3d, z_obj -- is affected.
 Each forward therefore reseeds numpy: extract transforms frames in order, so
@@ -126,6 +139,21 @@ def build_inputs(batch: dict, seq_len: int, device: str, use_gt_intrinsics: bool
     }
 
 
+def swap_query(inp: dict, n: int) -> dict:
+    """Replace frame n with frame n+1, leaving frames [0, n) untouched.
+
+    Gives pass B' a different query frame at identical shapes, so the GEMM tiling
+    that sets the numerical floor is the same in B and B' and cancels in the
+    comparison. Only entries carrying a frame axis are reindexed; cat_labels is
+    [B] and use_gt_intrinsics is a bool.
+    """
+    return {
+        k: torch.cat([v[:, :n], v[:, n + 1:n + 2]], dim=1)
+        if torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] >= n + 2 else v
+        for k, v in inp.items()
+    }
+
+
 def forward(model: torch.nn.Module, inp: dict, num_frames: int, num_ref_frames, seed: int):
     """One forward over the first num_frames frames, keeping only COMPARE_KEYS on CPU.
 
@@ -182,7 +210,12 @@ def main():
                              "num_ref+1 should stay <= 4 or frame count becomes a second shift")
     parser.add_argument("--num_seqs", type=int, default=10, help="object sequences to evaluate")
     parser.add_argument("--start", type=int, default=0, help="first frame index of the window")
-    parser.add_argument("--tol", type=float, default=1e-4, help="selfcheck pass threshold")
+    parser.add_argument("--tol", type=float, default=1e-4,
+                        help="reporting threshold for SELFCHECK; not a gate (see module docstring)")
+    parser.add_argument("--tol_leak", type=float, default=0.0,
+                        help="LEAK pass threshold. Zero on purpose: B and B' differ only in the "
+                             "query frame's content, at identical shapes, so a correctly gated "
+                             "readout reproduces the reference frames bit for bit")
     parser.add_argument("--seed", type=int, default=0,
                         help="numpy seed set before every forward, so sonata's train-mode "
                              "GridSample picks the same voxel representatives in each pass")
@@ -191,6 +224,9 @@ def main():
     args = parser.parse_args()
 
     seq_len = args.num_ref + 1
+    # One frame beyond the readout window, used only as the alternative query in
+    # pass B'. It never enters the reference block.
+    window = seq_len + 1
     model, device = load_opt_model(checkpoint_path=args.checkpoint)
 
     common_conf = build_common_conf(img_size=518, patch_size=14)
@@ -198,7 +234,7 @@ def main():
         common_conf,
         data_root=args.data_root,
         split="test",
-        min_num_images=seq_len,
+        min_num_images=window,
         sample_num=1024,
     )
     # Go/no-go, same shape as the other lines' loader traps: a wrong extraction
@@ -207,45 +243,50 @@ def main():
 
     names = sorted(ds.seq_names)[: args.num_seqs]
     print(f"{len(ds.seq_names)} sequences available, evaluating {len(names)}, "
-          f"window = frames [{args.start}, {args.start + seq_len}), num_ref = {args.num_ref}")
+          f"window = frames [{args.start}, {args.start + window}), num_ref = {args.num_ref}, "
+          f"alternative query = frame {args.start + seq_len}")
 
     records = []
-    worst_selfcheck = 0.0
+    worst_leak = 0.0
     for name in names:
         entries = ds.chunks[name]
-        if len(entries) < args.start + seq_len:
-            print(f"[skip] {name}: {len(entries)} frames < {args.start + seq_len}")
+        if len(entries) < args.start + window:
+            print(f"[skip] {name}: {len(entries)} frames < {args.start + window}")
             continue
 
-        ids = list(range(args.start, args.start + seq_len))
+        ids = list(range(args.start, args.start + window))
         batch = ds.get_data(seq_name=name, ids=ids, aspect_ratio=1.0)
-        if len(batch["images"]) != seq_len:
+        if len(batch["images"]) != window:
             # process_record drops frames whose instance mask is too small, and then
             # resamples at random -- which would break the shared-input premise.
-            print(f"[skip] {name}: loader returned {len(batch['images'])} of {seq_len} frames")
+            print(f"[skip] {name}: loader returned {len(batch['images'])} of {window} frames")
             continue
 
-        inp = build_inputs(batch, seq_len, device, args.use_gt_intrinsics)
+        inp = build_inputs(batch, window, device, args.use_gt_intrinsics)
+        inp_alt = swap_query(inp, args.num_ref)
 
         a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed)
         b = forward(model, inp, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        b2 = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
         c = forward(model, inp, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
 
+        leak = compare_frames(b, b2, slice(0, args.num_ref))
         selfcheck = compare_frames(a, b, slice(0, args.num_ref))
         drift = compare_frames(c, b, slice(args.num_ref, seq_len))
 
-        seq_worst = max(v[0] for v in selfcheck.values())
-        worst_selfcheck = max(worst_selfcheck, seq_worst)
+        worst_leak = max(worst_leak, max(v[0] for v in leak.values()))
 
         print(f"--- {name}")
+        print(f"    LEAK      {fmt(leak)}")
         print(f"    SELFCHECK {fmt(selfcheck)}")
         print(f"    DRIFT     {fmt(drift)}")
-        records.append({"seq_name": name, "ids": ids, "selfcheck": selfcheck, "drift": drift})
+        records.append({"seq_name": name, "ids": ids,
+                        "leak": leak, "selfcheck": selfcheck, "drift": drift})
 
     assert records, "every sequence was skipped"
 
     summary = {}
-    for stage in ("selfcheck", "drift"):
+    for stage in ("leak", "selfcheck", "drift"):
         keys = sorted(records[0][stage])
         summary[stage] = {
             k: {
@@ -261,6 +302,7 @@ def main():
         "start": args.start,
         "num_seqs": len(records),
         "tol": args.tol,
+        "tol_leak": args.tol_leak,
         "summary": summary,
         "per_sequence": records,
     }
@@ -268,16 +310,19 @@ def main():
         json.dump(result, f, indent=2)
 
     print("\n=== summary over", len(records), "sequences ===")
-    for stage in ("selfcheck", "drift"):
+    for stage in ("leak", "selfcheck", "drift"):
         for k, v in summary[stage].items():
             print(f"{stage:9s} {k:18s} max_abs={v['max_abs']:.3e}  max_rel={v['max_rel']:.2%}")
     print(f"\nwrote {args.out}")
 
-    if worst_selfcheck > args.tol:
-        print(f"SELFCHECK FAILED: {worst_selfcheck:.3e} > tol {args.tol:.1e} -- "
-              "a cross-frame path is still ungated; the DRIFT numbers are meaningless")
+    if worst_leak > args.tol_leak:
+        print(f"LEAK FAILED: {worst_leak:.3e} > {args.tol_leak:.1e} -- the reference frames "
+              "moved when only the query frame's content changed, so a cross-frame path is "
+              "still ungated and the DRIFT numbers are meaningless")
         sys.exit(1)
-    print(f"SELFCHECK OK: {worst_selfcheck:.3e} <= tol {args.tol:.1e}")
+    print(f"LEAK OK: {worst_leak:.3e} <= {args.tol_leak:.1e} -- no query-frame information "
+          "reaches the reference block. Any SELFCHECK residual above this is the GEMM-shape "
+          "floor amplified by GridSample, not a gating failure.")
 
 
 if __name__ == "__main__":
