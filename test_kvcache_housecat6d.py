@@ -59,6 +59,34 @@ the pair pinned twice what it accounted for.
             and FIDELITY proves nothing. Step 0 shipped two controls that could
             not fail; this one can.
 
+PRECISION (--dtype). fp32 is what the HouseCat6D path does today: no autocast
+anywhere, and torch 2.x leaves TF32 matmul OFF by default, so on Ampere the fp32
+runs are leaving throughput on the table. Three settings:
+
+  fp32   as shipped.
+  tf32   two backend flags. Ampere+ only, 10-bit mantissa, tensors stay fp32 --
+         so it changes speed and not one byte of memory.
+  bf16   autocast. Weights stay fp32 and the norms with them; what changes is the
+         matmuls and, because the cache IS a pair of projections, the cache: 128.8
+         MiB per reference frame instead of 257.6. That is the difference between
+         a 70-frame cache fitting a 24 GB card and not. The checkpoint was trained
+         in bf16 (housecat_default.yaml:250), so this is arguably the faithful
+         setting and fp32 the deviation.
+
+  bf16 needs sm_80+. On Turing (passau, the 12g partition) it runs but is
+  emulated, and the timing means nothing.
+
+Precision cost and cache fidelity are DIFFERENT comparisons and are kept apart,
+because a control that differs from the test in two ways is not a control:
+
+  PRECISION  readout at --dtype vs readout in fp32, on the query frame. What
+             precision alone costs, with no cache involved. Reported, not gated:
+             there is no threshold worth inventing before seeing the number.
+  FIDELITY   cached vs readout AT THE SAME DTYPE. What the cache costs, within
+             whatever precision it is running. The tolerance is per dtype -- bf16
+             carries about three decimal digits, so its floor is orders above
+             fp32's and gating both at 1e-4 would be meaningless.
+
 WHAT IS MEASURED. Milliseconds per query frame for the cached path against
 recomputing the whole readout, and the cache's size in bytes, both against
 --num_ref.
@@ -84,6 +112,7 @@ Usage (see tools/opt_pose_kvcache.sh):
 """
 
 import argparse
+import contextlib
 import json
 import sys
 
@@ -98,42 +127,55 @@ from test_causal_housecat6d import build_common_conf, build_inputs, compare, sel
 from training.data.datasets.housecat import HouseCat6DPoseDataset
 
 
-def readout_fwd(agg, images, n):
+def set_precision(dtype: str):
+    """TF32 is a global backend switch, not a context; bf16 is a context, not a switch."""
+    allow_tf32 = dtype == "tf32"
+    torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+    torch.backends.cudnn.allow_tf32 = allow_tf32
+
+
+def amp_ctx(dtype: str):
+    if dtype == "bf16":
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def readout_fwd(agg, images, n, dtype="fp32"):
     """Step 0.5's pass: [0, n] with the reference block masked off from the query.
 
     Returns the GPU tensors. The timing calls use this directly, so no device
     transfer lands inside a measurement.
     """
-    with torch.inference_mode():
+    with torch.inference_mode(), amp_ctx(dtype):
         out, _ = agg(images=images, num_ref_frames=n)
         return out
 
 
-def query_fwd(agg, images_query, cache):
+def query_fwd(agg, images_query, cache, dtype="fp32"):
     """Tracking phase: one frame, attending to the stored block."""
-    with torch.inference_mode():
+    with torch.inference_mode(), amp_ctx(dtype):
         out, _ = agg(images=images_query, kv_cache=cache)
         return out
 
 
-def build_cache(agg, images_ref):
+def build_cache(agg, images_ref, dtype="fp32"):
     """Mapping phase: a plain forward over the reference frames, keeping their k/v."""
     cache = []
-    with torch.inference_mode():
+    with torch.inference_mode(), amp_ctx(dtype):
         agg(images=images_ref, collect_kv=cache)
     return cache
 
 
-def run_readout(agg, images, n):
+def run_readout(agg, images, n, dtype="fp32"):
     """readout_fwd, query frame only, on the CPU for comparison."""
     with torch.inference_mode():
-        return [t[:, n : n + 1].float().cpu() for t in readout_fwd(agg, images, n)]
+        return [t[:, n : n + 1].float().cpu() for t in readout_fwd(agg, images, n, dtype)]
 
 
-def run_query(agg, images_query, cache):
+def run_query(agg, images_query, cache, dtype="fp32"):
     """query_fwd on the CPU for comparison."""
     with torch.inference_mode():
-        return [t.float().cpu() for t in query_fwd(agg, images_query, cache)]
+        return [t.float().cpu() for t in query_fwd(agg, images_query, cache, dtype)]
 
 
 def compare_lists(left, right):
@@ -181,12 +223,18 @@ def main():
     parser.add_argument("--query_gap", type=int, default=1,
                         help="frames from the last reference frame to the query frame, as in "
                              "test_causal_housecat6d.py")
-    parser.add_argument("--tol_fidelity", type=float, default=1e-4,
+    parser.add_argument("--dtype", choices=("fp32", "tf32", "bf16"), default="fp32",
+                        help="fp32 as shipped; tf32 flips the two Ampere backend flags "
+                             "(torch 2.x defaults them off, tensors stay fp32); bf16 "
+                             "autocasts, which also halves the cache. sm_80+ for both")
+    parser.add_argument("--tol_fidelity", type=float, default=None,
                         help="ceiling on the RELATIVE difference between the cached query pass "
-                             "and the readout. The expected magnitude is the ~1e-6 GEMM floor; "
-                             "this is set two orders above it, because what would signal a real "
-                             "error -- a wrong special token, an unapplied RoPE, an off-by-one "
-                             "in the cache -- lands far higher than that, not just above it")
+                             "and the readout AT THE SAME DTYPE. Default depends on dtype: 1e-4 "
+                             "for fp32/tf32, where the floor is the ~1e-5 GEMM residue, and 1e-2 "
+                             "for bf16, which carries about three decimal digits. Set two orders "
+                             "above each floor, because what would signal a real error -- a wrong "
+                             "special token, an unapplied RoPE, an off-by-one in the cache -- "
+                             "lands far higher than that, not just above it")
     parser.add_argument("--zeroed_margin", type=float, default=100.0,
                         help="the zeroed-cache control must be at least this many times worse "
                              "than FIDELITY, or the cache is not being read")
@@ -202,6 +250,14 @@ def main():
     args = parser.parse_args()
 
     assert args.query_gap >= 1, "--query_gap 1 is the adjacent case; 0 would query a reference frame"
+    if args.tol_fidelity is None:
+        args.tol_fidelity = 1e-2 if args.dtype == "bf16" else 1e-4
+    set_precision(args.dtype)
+    cap = torch.cuda.get_device_capability()
+    assert args.dtype == "fp32" or cap >= (8, 0), (
+        f"--dtype {args.dtype} needs sm_80+, this is sm_{cap[0]}{cap[1]}. On Turing bf16 is "
+        "emulated and tf32 does not exist, so the timing would be meaningless"
+    )
     n = args.num_ref
     q_idx = n - 1 + args.query_gap
     window = q_idx + 1
@@ -217,7 +273,7 @@ def main():
 
     names = sorted(ds.seq_names)[: args.num_seqs]
     print(f"{len(ds.seq_names)} sequences available, evaluating {len(names)}, "
-          f"num_ref = {n}, query_gap = {args.query_gap}, "
+          f"dtype = {args.dtype}, num_ref = {n}, query_gap = {args.query_gap}, "
           f"window = frames [{args.start}, {args.start + window}), query = frame {args.start + q_idx}")
 
     records = []
@@ -244,7 +300,7 @@ def main():
 
         np.random.seed(args.seed)
         torch.cuda.reset_peak_memory_stats()
-        cache = build_cache(agg, images_ref)
+        cache = build_cache(agg, images_ref, args.dtype)
         assert len(cache) == len(agg.global_blocks)
         n_bytes = cache_bytes(cache)
         peak_build = torch.cuda.max_memory_allocated()
@@ -253,36 +309,49 @@ def main():
         # into a larger allocation.
         resident = torch.cuda.memory_allocated()
 
-        fidelity = repeat = control = None
+        fidelity = repeat = control = precision = None
         if not args.cache_only:
-            query = run_query(agg, images_query, cache)
+            query = run_query(agg, images_query, cache, args.dtype)
 
             np.random.seed(args.seed)
-            readout = run_readout(agg, images, n)
+            readout = run_readout(agg, images, n, args.dtype)
             fidelity = compare_lists(query, readout)
+
+            # What precision alone costs: the same readout, one in fp32. No cache is
+            # involved, so this and FIDELITY move for different reasons and are never
+            # summed. fp32 compares against itself and is trivially zero, so skip it.
+            if args.dtype != "fp32":
+                set_precision("fp32")
+                np.random.seed(args.seed)
+                readout_fp32 = run_readout(agg, images, n, "fp32")
+                precision = compare_lists(readout, readout_fp32)
+                del readout_fp32
+                set_precision(args.dtype)
+                torch.cuda.empty_cache()
 
             # A second, independently built cache: the floor of the cached path itself.
             # Freed before the control allocates a third one -- each cache is 258 MiB
             # per reference frame in fp32, and three of them plus the weights and a
             # readout pass are what put n=8 over a 16 GB card.
-            cache2 = build_cache(agg, images_ref)
-            query2 = run_query(agg, images_query, cache2)
+            cache2 = build_cache(agg, images_ref, args.dtype)
+            query2 = run_query(agg, images_query, cache2, args.dtype)
             repeat = compare_lists(query, query2)
             del cache2, query2
             torch.cuda.empty_cache()
 
             with torch.inference_mode():
                 zeroed = [(torch.zeros_like(k), torch.zeros_like(v)) for k, v in cache]
-            query_zeroed = run_query(agg, images_query, zeroed)
+            query_zeroed = run_query(agg, images_query, zeroed, args.dtype)
             control = compare_lists(query_zeroed, readout)
             del zeroed, query_zeroed, query, readout
             torch.cuda.empty_cache()
 
         # Timed on the GPU tensors: a device transfer is not part of what a tracker
         # would pay per frame, and it is the same for both paths anyway.
-        ms_cached = time_ms(lambda: query_fwd(agg, images_query, cache), args.warmup, args.iters)
+        ms_cached = time_ms(lambda: query_fwd(agg, images_query, cache, args.dtype),
+                            args.warmup, args.iters)
         ms_readout = None if args.cache_only else time_ms(
-            lambda: readout_fwd(agg, images, n), args.warmup, args.iters)
+            lambda: readout_fwd(agg, images, n, args.dtype), args.warmup, args.iters)
 
         print(f"--- {name}")
         print(f"    cache {n_bytes / 2**20:.1f} MiB claimed   {resident / 2**20:.1f} MiB "
@@ -296,12 +365,15 @@ def main():
                 failures.append((name, fidelity, control, ok_fidelity, ok_control))
             print(f"    FIDELITY {fidelity[0]:.3e} ({fidelity[1]:.2%})   "
                   f"REPEAT {repeat[0]:.3e}   ZEROED {control[0]:.3e} ({control[1]:.2%})")
+            if precision is not None:
+                print(f"    PRECISION vs fp32 {precision[0]:.3e} ({precision[1]:.2%})")
             print(f"    cached {ms_cached:.1f} ms   readout {ms_readout:.1f} ms   "
                   f"speedup {ms_readout / ms_cached:.2f}x")
 
         records.append({
             "seq_name": name, "ids": ids,
             "fidelity": fidelity, "repeat": repeat, "zeroed": control,
+            "precision_vs_fp32": precision,
             "cache_bytes": n_bytes, "peak_build_bytes": peak_build,
             "resident_after_build_bytes": resident,
             "ms_cached": ms_cached, "ms_readout": ms_readout,
@@ -327,7 +399,11 @@ def main():
             "ms_readout_median": float(np.median([r["ms_readout"] for r in records])),
             "speedup_median": float(np.median([r["speedup"] for r in records])),
         })
+        if records[0]["precision_vs_fp32"] is not None:
+            summary["precision_max_abs"] = max(r["precision_vs_fp32"][0] for r in records)
+            summary["precision_max_rel"] = max(r["precision_vs_fp32"][1] for r in records)
     result = {
+        "dtype": args.dtype,
         "num_ref": n, "start": args.start, "query_gap": args.query_gap,
         "query_index": args.start + q_idx, "num_seqs": len(records),
         "tol_fidelity": args.tol_fidelity, "zeroed_margin": args.zeroed_margin,
@@ -337,7 +413,12 @@ def main():
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
 
-    print(f"\n=== summary over {len(records)} sequences, num_ref = {n} ===")
+    print(f"\n=== summary over {len(records)} sequences, num_ref = {n}, "
+          f"dtype = {args.dtype} ===")
+    if "precision_max_rel" in summary:
+        print(f"PRECISION max {summary['precision_max_abs']:.3e} "
+              f"({summary['precision_max_rel']:.2%}) vs fp32 -- the cost of {args.dtype} "
+              "alone, no cache involved")
     if not args.cache_only:
         print(f"FIDELITY  max {summary['fidelity_max_abs']:.3e} ({summary['fidelity_max_rel']:.2%})  "
               f"-- expected at the GEMM floor, tol {args.tol_fidelity:.0e} relative")
