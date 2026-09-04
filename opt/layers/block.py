@@ -78,17 +78,24 @@ class Block(nn.Module):
 
         self.sample_drop_ratio = drop_path
 
-    def forward(self, x: Tensor, pos=None, num_ref_tokens=None) -> Tensor:
-        # num_ref_tokens is forwarded to the attention; the MLP, LayerNorms and
-        # residuals are token-wise, so nothing else needs to know about the split.
+    def forward(self, x: Tensor, pos=None, num_ref_tokens=None, kv_cache=None, collect_kv=None) -> Tensor:
+        # These are forwarded to the attention; the MLP, LayerNorms and residuals are
+        # token-wise, so nothing else needs to know about the split or the cache.
         # Forwarded only when set: NestedTensorBlock subclasses this and delegates
-        # tensor input to it, and its MemEffAttention takes no num_ref_tokens. That
-        # block is the DINOv2 patch embedder, which is per-frame and never carries a
-        # readout split, so passing it unconditionally broke a plain forward.
+        # tensor input to it, and its MemEffAttention takes none of these arguments.
+        # That block is the DINOv2 patch embedder, which is per-frame and never
+        # carries a readout split, so passing them unconditionally broke a plain
+        # forward once already.
+        attn_kwargs = {}
+        if num_ref_tokens is not None:
+            attn_kwargs["num_ref_tokens"] = num_ref_tokens
+        if kv_cache is not None:
+            attn_kwargs["kv_cache"] = kv_cache
+        if collect_kv is not None:
+            attn_kwargs["collect_kv"] = collect_kv
+
         def attn_residual_func(x: Tensor, pos=None) -> Tensor:
-            if num_ref_tokens is None:
-                return self.ls1(self.attn(self.norm1(x), pos=pos))
-            return self.ls1(self.attn(self.norm1(x), pos=pos, num_ref_tokens=num_ref_tokens))
+            return self.ls1(self.attn(self.norm1(x), pos=pos, **attn_kwargs))
 
         def ffn_residual_func(x: Tensor) -> Tensor:
             return self.ls2(self.mlp(self.norm2(x)))

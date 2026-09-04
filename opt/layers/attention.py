@@ -52,13 +52,33 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x: Tensor, pos=None, num_ref_tokens=None) -> Tensor:
+    def forward(self, x: Tensor, pos=None, num_ref_tokens=None, kv_cache=None, collect_kv=None) -> Tensor:
         """
         num_ref_tokens: enables the KV-Tracker-style causal readout. The first
         `num_ref_tokens` positions are the reference (cache) block and attend only
         among themselves; the remaining positions are the single query block and
         attend to [reference, query]. Equivalent to a block attention mask, but
         keeps the fused kernels. Inference only.
+
+        collect_kv: a list. The post-RoPE, post-q/k-norm k and v of this call are
+            appended to it as one (k, v) tuple. This is how a cache is built: run a
+            plain forward over the reference frames and keep what they projected.
+
+        kv_cache: a (k_ref, v_ref) pair from an earlier collect_kv. `x` is then the
+            query frame's tokens ALONE, and it attends to [k_ref, k_q] -- the same
+            quantity the readout computes, minus recomputing the reference block.
+            The cache is immutable: the query's own k/v are never written back, so
+            the reference representation cannot drift, which is the property that
+            makes KV-Tracker's cache reusable across frames.
+
+        Both are inference-only, and mutually exclusive with each other's mode:
+        num_ref_tokens splits one sequence, kv_cache replaces the reference half of
+        that split with stored tensors.
+
+        RoPE is what makes the stored k reusable. It encodes per-frame 2D patch
+        coordinates only (aggregator.py's position_getter), identical for every
+        frame, so a reference frame's k does not depend on how many frames follow
+        it or on where the query sits in time.
         """
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
@@ -69,7 +89,26 @@ class Attention(nn.Module):
             q = self.rope(q, pos)
             k = self.rope(k, pos)
 
-        if self.fused_attn:
+        if collect_kv is not None:
+            assert not self.training, "collect_kv is an inference-only cache build"
+            assert kv_cache is None, "collect_kv builds a cache; kv_cache consumes one"
+            collect_kv.append((k, v))
+
+        if kv_cache is not None:
+            assert not self.training, "kv_cache is an inference-only readout"
+            assert num_ref_tokens is None, (
+                "kv_cache already IS the reference block; num_ref_tokens would split "
+                "the query frame against itself"
+            )
+            assert self.fused_attn, "kv_cache requires fused_attn"
+            k_ref, v_ref = kv_cache
+            assert k_ref.shape[0] == B and k_ref.shape[1] == self.num_heads, (
+                f"cache {tuple(k_ref.shape)} does not match this attention's [B, H] = {(B, self.num_heads)}"
+            )
+            k = torch.cat([k_ref, k], dim=2)
+            v = torch.cat([v_ref, v], dim=2)
+            x = F.scaled_dot_product_attention(q, k, v)
+        elif self.fused_attn:
             if num_ref_tokens is None:
                 x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.0)
             else:

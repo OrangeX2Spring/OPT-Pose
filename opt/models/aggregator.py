@@ -227,6 +227,8 @@ class Aggregator(nn.Module):
         images: torch.Tensor,
         masks: Optional[torch.Tensor] = None,
         num_ref_frames: Optional[int] = None,
+        kv_cache: Optional[List] = None,
+        collect_kv: Optional[List] = None,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -237,6 +239,17 @@ class Aggregator(nn.Module):
                 do not see the query frame, while the query frame attends to everything.
                 Must equal S - 1 -- exactly one query frame, and it must be last.
                 Frame attention is untouched; it is per-frame already. Inference only.
+            collect_kv (list, optional): appended with one (k, v) per global block, in
+                block order. Run this over the reference frames alone to build a cache.
+            kv_cache (list, optional): a cache from collect_kv. `images` is then the
+                query frame ALONE (S=1) and the reference block is never recomputed --
+                the same arithmetic num_ref_frames performs, minus the recomputation.
+                Its special tokens are taken from the non-first-frame slice, since a
+                query frame is by construction not frame 0.
+
+                Frame attention still runs on the query frame, and the DPT heads still
+                decode it; what this removes is the reference block's share of the 24
+                global blocks, which is the only cost that grows with cache size.
 
         Returns:
             (list[torch.Tensor], int):
@@ -247,6 +260,21 @@ class Aggregator(nn.Module):
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
+
+        if kv_cache is not None:
+            assert not self.training, "kv_cache is an inference-only readout"
+            assert num_ref_frames is None, "kv_cache IS the reference block"
+            assert collect_kv is None, "collect_kv builds a cache; kv_cache consumes one"
+            assert S == 1, f"a cached readout takes exactly one query frame, got S={S}"
+            assert len(kv_cache) == len(self.global_blocks), (
+                f"cache has {len(kv_cache)} entries, expected one per global block "
+                f"({len(self.global_blocks)})"
+            )
+
+        if collect_kv is not None:
+            assert not self.training, "collect_kv is an inference-only cache build"
+            assert num_ref_frames is None, "build the cache from a plain forward over the references"
+            assert len(collect_kv) == 0, "pass an empty list; entries are appended in block order"
 
         if num_ref_frames is not None:
             assert not self.training, "num_ref_frames is an inference-only readout"
@@ -284,8 +312,12 @@ class Aggregator(nn.Module):
         _, P, C = patch_tokens.shape
 
         # Expand camera and register tokens to match batch size and sequence length
-        camera_token = slice_expand_and_flatten(self.camera_token, B, S)
-        register_token = slice_expand_and_flatten(self.register_token, B, S)
+        # A cached query pass is handed one frame that is NOT frame 0, so it must not
+        # be given frame 0's special tokens. Every other pass keeps the original
+        # behaviour: first frame gets slice 0, the rest slice 1.
+        first_frame = kv_cache is None
+        camera_token = slice_expand_and_flatten(self.camera_token, B, S, first_frame=first_frame)
+        register_token = slice_expand_and_flatten(self.register_token, B, S, first_frame=first_frame)
 
         # Concatenate special tokens with patch tokens
         tokens = torch.cat([camera_token, register_token, patch_tokens], dim=1)
@@ -320,7 +352,8 @@ class Aggregator(nn.Module):
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
-                        tokens, B, S, P, C, global_idx, pos=pos, num_ref_tokens=num_ref_tokens
+                        tokens, B, S, P, C, global_idx, pos=pos, num_ref_tokens=num_ref_tokens,
+                        kv_cache=kv_cache, collect_kv=collect_kv,
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -359,7 +392,8 @@ class Aggregator(nn.Module):
 
         return tokens, frame_idx, intermediates
 
-    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, num_ref_tokens=None):
+    def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, num_ref_tokens=None,
+                                  kv_cache=None, collect_kv=None):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -377,17 +411,25 @@ class Aggregator(nn.Module):
                 assert num_ref_tokens is None, "num_ref_tokens is an inference-only readout"
                 tokens = checkpoint(self.global_blocks[global_idx], tokens, pos, use_reentrant=self.use_reentrant)
             else:
-                tokens = self.global_blocks[global_idx](tokens, pos=pos, num_ref_tokens=num_ref_tokens)
+                # collect_kv is handed the same list to every block, and blocks run in
+                # order, so it comes back indexed by global_idx.
+                tokens = self.global_blocks[global_idx](
+                    tokens, pos=pos, num_ref_tokens=num_ref_tokens,
+                    kv_cache=None if kv_cache is None else kv_cache[global_idx],
+                    collect_kv=collect_kv,
+                )
             global_idx += 1
             intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 
 
-def slice_expand_and_flatten(token_tensor, B, S):
+def slice_expand_and_flatten(token_tensor, B, S, first_frame=True):
     """
     Processes specialized tokens with shape (1, 2, X, C) for multi-frame processing:
-    1) Uses the first position (index=0) for the first frame only
+    1) Uses the first position (index=0) for the first frame only, unless
+       first_frame=False, in which case every frame gets the second position. That is
+       for a cached query pass, whose single frame is not frame 0 of the sequence.
     2) Uses the second position (index=1) for all remaining frames (S-1 frames)
     3) Expands both to match batch size B
     4) Concatenates to form (B, S, X, C) where each sequence has 1 first-position token
@@ -397,6 +439,10 @@ def slice_expand_and_flatten(token_tensor, B, S):
     Returns:
         torch.Tensor: Processed tokens with shape (B*S, X, C)
     """
+
+    if not first_frame:
+        combined = token_tensor[:, 1:, ...].expand(B, S, *token_tensor.shape[2:])
+        return combined.reshape(B * S, *combined.shape[2:])
 
     # Slice out the "query" tokens => shape (1, 1, ...)
     query = token_tensor[:, 0:1, ...].expand(B, 1, *token_tensor.shape[2:])
