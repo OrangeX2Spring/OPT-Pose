@@ -80,12 +80,22 @@ Precision cost and cache fidelity are DIFFERENT comparisons and are kept apart,
 because a control that differs from the test in two ways is not a control:
 
   PRECISION  readout at --dtype vs readout in fp32, on the query frame. What
-             precision alone costs, with no cache involved. Reported, not gated:
-             there is no threshold worth inventing before seeing the number.
+             precision alone costs, with no cache involved.
   FIDELITY   cached vs readout AT THE SAME DTYPE. What the cache costs, within
-             whatever precision it is running. The tolerance is per dtype -- bf16
-             carries about three decimal digits, so its floor is orders above
-             fp32's and gating both at 1e-4 would be meaningless.
+             whatever precision it is running.
+
+FIDELITY is gated against PRECISION, not against a chosen constant: the cache
+passes when it moves the output no more than switching precision does. That is a
+MEASURED floor, which is the same correction Step 0.5 had to make when LEAK was
+being judged against zero instead of against a repeat run.
+
+The first attempt did invent a constant, and it was wrong within the hour. tf32
+was given fp32's 1e-4 on the reasoning that "tensors stay fp32, so the floor is
+unchanged" -- but tf32 truncates mantissas inside the matmul, so its floor is
+~1e-3, and the tf32 run failed 10 of 10 while REPEAT sat at exactly zero and
+FIDELITY came in BELOW PRECISION on every sequence. The numbers were fine; the
+threshold was fiction. --tol_fidelity survives as an absolute floor for fp32,
+where there is no PRECISION to compare against.
 
 WHAT IS MEASURED. Milliseconds per query frame for the cached path against
 recomputing the whole readout, and the cache's size in bytes, both against
@@ -228,13 +238,11 @@ def main():
                              "(torch 2.x defaults them off, tensors stay fp32); bf16 "
                              "autocasts, which also halves the cache. sm_80+ for both")
     parser.add_argument("--tol_fidelity", type=float, default=None,
-                        help="ceiling on the RELATIVE difference between the cached query pass "
-                             "and the readout AT THE SAME DTYPE. Default depends on dtype: 1e-4 "
-                             "for fp32/tf32, where the floor is the ~1e-5 GEMM residue, and 1e-2 "
-                             "for bf16, which carries about three decimal digits. Set two orders "
-                             "above each floor, because what would signal a real error -- a wrong "
-                             "special token, an unapplied RoPE, an off-by-one in the cache -- "
-                             "lands far higher than that, not just above it")
+                        help="absolute floor on the RELATIVE difference between the cached query "
+                             "pass and the readout, used only in fp32. At any other dtype the gate "
+                             "is FIDELITY <= PRECISION -- a measured floor rather than a chosen "
+                             "one, since the arithmetic perturbation of the precision itself is "
+                             "the right yardstick for an arithmetic perturbation of the cache")
     parser.add_argument("--zeroed_margin", type=float, default=100.0,
                         help="the zeroed-cache control must be at least this many times worse "
                              "than FIDELITY, or the cache is not being read")
@@ -251,7 +259,8 @@ def main():
 
     assert args.query_gap >= 1, "--query_gap 1 is the adjacent case; 0 would query a reference frame"
     if args.tol_fidelity is None:
-        args.tol_fidelity = 1e-2 if args.dtype == "bf16" else 1e-4
+        # Only used where PRECISION does not exist, i.e. fp32 against itself.
+        args.tol_fidelity = 1e-4
     set_precision(args.dtype)
     cap = torch.cuda.get_device_capability()
     assert args.dtype == "fp32" or cap >= (8, 0), (
@@ -359,7 +368,9 @@ def main():
         if args.cache_only:
             print(f"    cached {ms_cached:.1f} ms   (readout baseline skipped)")
         else:
-            ok_fidelity = fidelity[1] <= args.tol_fidelity
+            # Against the measured floor where one exists, the constant otherwise.
+            floor = args.tol_fidelity if precision is None else max(args.tol_fidelity, precision[1])
+            ok_fidelity = fidelity[1] <= floor
             ok_control = control[0] >= args.zeroed_margin * max(fidelity[0], 1e-12)
             if not (ok_fidelity and ok_control):
                 failures.append((name, fidelity, control, ok_fidelity, ok_control))
@@ -447,10 +458,12 @@ def main():
         print(f"\nFAILED on {len(failures)} of {len(records)} sequences:")
         for name, fid, ctl, ok_f, ok_c in failures:
             if not ok_f:
-                print(f"  {name}: FIDELITY {fid[1]:.2%} over tol -- the cached pass is not "
-                      "computing what the readout computes. Suspect, in order: the query "
-                      "frame's special tokens (a cached pass must NOT get frame 0's), the "
-                      "cache being stale or in the wrong block order, RoPE applied twice.")
+                print(f"  {name}: FIDELITY {fid[1]:.2%} over its floor -- the cached pass moved "
+                      "the output MORE than the precision it is running in does, so this is not "
+                      "arithmetic. Suspect, in order: the query frame's special tokens (a cached "
+                      "pass must NOT get frame 0's), the cache being stale or in the wrong block "
+                      "order, RoPE applied twice. Check REPEAT first: if it is also non-zero the "
+                      "problem is not the cache at all.")
             if not ok_c:
                 print(f"  {name}: ZEROED {ctl[0]:.3e} is not {args.zeroed_margin:g}x worse than "
                       f"FIDELITY {fid[0]:.3e} -- zeroing the cache barely changed the output, "
