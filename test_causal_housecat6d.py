@@ -98,6 +98,7 @@ Usage (see tools/opt_pose_causal.sbatch, this is not meant to be run by hand):
 """
 
 import argparse
+import contextlib
 import json
 import sys
 
@@ -191,13 +192,19 @@ def select_query(inp: dict, n: int, q_idx: int) -> dict:
     }
 
 
-def forward(model: torch.nn.Module, inp: dict, num_frames: int, num_ref_frames, seed: int):
+def forward(model: torch.nn.Module, inp: dict, num_frames: int, num_ref_frames, seed: int,
+            dtype: str = "fp32"):
     """One forward over the first num_frames frames, keeping only COMPARE_KEYS on CPU.
 
     Reseeds numpy first; see the module docstring on sonata's GridSample.
+
+    dtype="bf16" autocasts. Step 1a measured bf16 as 3.4x faster on the aggregator
+    but moved its token outputs 3.9-11.1%, and token drift says nothing about what
+    the geometry heads do -- which is what this script exists to measure.
     """
     np.random.seed(seed)
-    with torch.inference_mode():
+    amp = torch.autocast("cuda", dtype=torch.bfloat16) if dtype == "bf16" else contextlib.nullcontext()
+    with torch.inference_mode(), amp:
         preds = model(
             images=inp["images"][:, :num_frames],
             cat_labels=inp["cat_labels"],
@@ -279,6 +286,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0,
                         help="numpy seed set before every forward, so sonata's train-mode "
                              "GridSample picks the same voxel representatives in each pass")
+    parser.add_argument("--dtype", choices=("fp32", "bf16"), default="fp32",
+                        help="bf16 autocasts and needs sm_80+. It adds one comparison, "
+                             "PRECISION: the same bidirectional pass in bf16 against fp32, on "
+                             "the query frame. That is the cost of precision alone, and it is "
+                             "kept apart from DRIFT, which is the cost of the readout")
     parser.add_argument("--use_gt_intrinsics", action="store_true")
     parser.add_argument("--out", type=str, required=True, help="results json")
     args = parser.parse_args()
@@ -336,23 +348,34 @@ def main():
         assert torch.equal(inp_b["images"][:, : args.num_ref],
                            inp_alt["images"][:, : args.num_ref]), "reference frames differ"
 
-        a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed)
-        b = forward(model, inp_b, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+        a = forward(model, inp, num_frames=args.num_ref, num_ref_frames=None, seed=args.seed,
+                    dtype=args.dtype)
+        b = forward(model, inp_b, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed,
+                    dtype=args.dtype)
         # The repeats come before B', so the floor is drawn from the same stretch of
         # allocator history that B' occupies. Compared and dropped one at a time --
         # holding every prediction dict would be pointless memory.
         rep_tables = []
         for inp_rep in inp_reps:
-            b_rep = forward(model, inp_rep, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
+            b_rep = forward(model, inp_rep, num_frames=seq_len, num_ref_frames=args.num_ref,
+                            seed=args.seed, dtype=args.dtype)
             rep_tables.append(compare_frames(b, b_rep, slice(0, args.num_ref)))
             del b_rep
-        b_alt = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref, seed=args.seed)
-        c = forward(model, inp_b, num_frames=seq_len, num_ref_frames=None, seed=args.seed)
+        b_alt = forward(model, inp_alt, num_frames=seq_len, num_ref_frames=args.num_ref,
+                        seed=args.seed, dtype=args.dtype)
+        c = forward(model, inp_b, num_frames=seq_len, num_ref_frames=None, seed=args.seed,
+                    dtype=args.dtype)
 
         repeat = max_table(rep_tables)
         leak = compare_frames(b, b_alt, slice(0, args.num_ref))
         selfcheck = compare_frames(a, b, slice(0, args.num_ref))
         drift = compare_frames(c, b, slice(args.num_ref, seq_len))
+        precision = None
+        if args.dtype != "fp32":
+            c_fp32 = forward(model, inp_b, num_frames=seq_len, num_ref_frames=None,
+                             seed=args.seed, dtype="fp32")
+            precision = compare_frames(c, c_fp32, slice(args.num_ref, seq_len))
+            del c_fp32
 
         # Per key, against that key's own floor: the amplification through
         # GridSample is three orders larger for nocs than for depth, so one
@@ -366,15 +389,23 @@ def main():
         print(f"    LEAK      {fmt(leak)}")
         print(f"    SELFCHECK {fmt(selfcheck)}")
         print(f"    DRIFT     {fmt(drift)}")
+        if precision is not None:
+            print(f"    PRECISION {fmt(precision)}")
         if over:
             print(f"    ^^ LEAK over REPEAT on: {', '.join(sorted(over))}")
-        records.append({"seq_name": name, "ids": ids, "repeat": repeat,
-                        "leak": leak, "selfcheck": selfcheck, "drift": drift})
+        record = {"seq_name": name, "ids": ids, "repeat": repeat,
+                  "leak": leak, "selfcheck": selfcheck, "drift": drift}
+        if precision is not None:
+            record["precision"] = precision
+        records.append(record)
 
     assert records, "every sequence was skipped"
 
     summary = {}
-    for stage in ("repeat", "leak", "selfcheck", "drift"):
+    stages = ("repeat", "leak", "selfcheck", "drift")
+    if "precision" in records[0]:
+        stages = stages + ("precision",)
+    for stage in stages:
         keys = sorted(records[0][stage])
         summary[stage] = {
             k: {
@@ -385,6 +416,7 @@ def main():
         }
 
     result = {
+        "dtype": args.dtype,
         "num_ref": args.num_ref,
         "seq_len": seq_len,
         "start": args.start,
@@ -400,8 +432,8 @@ def main():
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)
 
-    print("\n=== summary over", len(records), "sequences ===")
-    for stage in ("repeat", "leak", "selfcheck", "drift"):
+    print("\n=== summary over", len(records), f"sequences, dtype = {args.dtype} ===")
+    for stage in stages:
         for k, v in summary[stage].items():
             print(f"{stage:9s} {k:18s} max_abs={v['max_abs']:.3e}  max_rel={v['max_rel']:.2%}")
     print(f"\nwrote {args.out}")
