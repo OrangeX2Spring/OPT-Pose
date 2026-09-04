@@ -54,7 +54,16 @@ Step 0 a session. What is gated instead:
 
 WHAT IS MEASURED. Milliseconds per query frame for the cached path against
 recomputing the whole readout, and the cache's size in bytes, both against
---num_ref. Note that the timing sweep may go far past the checkpoint's
+--num_ref.
+
+--cache_only drops the readout, both controls and FIDELITY, leaving the build,
+the query and their cost. It exists because the READOUT baseline is what runs out
+of memory first: it holds 24 intermediates of [B, S, P, 2C], which is 2.4 GB at
+n=8 and 8.9 GB at n=32 in fp32, on top of 5.4 GB of weights -- so the comparison
+cannot reach the cache sizes worth measuring, while the cached path, which needs
+the cache plus one frame of activations, can. That asymmetry is not an
+inconvenience to work around; it is the argument for the cache stated in memory
+rather than in time. Establish fidelity at a small n, then sweep with this. Note that the timing sweep may go far past the checkpoint's
 img_nums: [2, 4] training window: n > 3 says nothing about accuracy, but a
 kernel does not care what a checkpoint was trained on, and the cost curve is the
 quantitative form of the redundancy objection -- dense per-patch K/V for
@@ -175,6 +184,10 @@ def main():
                         help="the zeroed-cache control must be at least this many times worse "
                              "than FIDELITY, or the cache is not being read")
     parser.add_argument("--seed", type=int, default=0, help="numpy seed, set before every pass")
+    parser.add_argument("--cache_only", action="store_true",
+                        help="skip the readout baseline, FIDELITY, REPEAT and ZEROED; measure "
+                             "only what the cached path costs. For the large-n cost curve, "
+                             "where the baseline no longer fits in memory")
     parser.add_argument("--warmup", type=int, default=2, help="untimed calls before timing")
     parser.add_argument("--iters", type=int, default=10, help="timed calls per measurement")
     parser.add_argument("--use_gt_intrinsics", action="store_true")
@@ -223,70 +236,80 @@ def main():
         images_ref, images_query = images[:, :n], images[:, n : n + 1]
 
         np.random.seed(args.seed)
-        readout = run_readout(agg, images, n)
-
-        np.random.seed(args.seed)
         cache = build_cache(agg, images_ref)
         assert len(cache) == len(agg.global_blocks)
-        query = run_query(agg, images_query, cache)
-
-        # A second, independently built cache: the floor of the cached path itself.
-        # Freed before the control allocates a third one -- at n=3 each cache is
-        # roughly 0.8 GB in fp32, and three of them plus the weights do not fit 16 GB.
-        cache2 = build_cache(agg, images_ref)
-        query2 = run_query(agg, images_query, cache2)
-        repeat = compare_lists(query, query2)
-        del cache2, query2
-        torch.cuda.empty_cache()
-
-        with torch.inference_mode():
-            zeroed = [(torch.zeros_like(k), torch.zeros_like(v)) for k, v in cache]
-        query_zeroed = run_query(agg, images_query, zeroed)
-        control = compare_lists(query_zeroed, readout)
-        del zeroed, query_zeroed
-        torch.cuda.empty_cache()
-
-        fidelity = compare_lists(query, readout)
         n_bytes = cache_bytes(cache)
+
+        fidelity = repeat = control = None
+        if not args.cache_only:
+            query = run_query(agg, images_query, cache)
+
+            np.random.seed(args.seed)
+            readout = run_readout(agg, images, n)
+            fidelity = compare_lists(query, readout)
+
+            # A second, independently built cache: the floor of the cached path itself.
+            # Freed before the control allocates a third one -- each cache is 258 MiB
+            # per reference frame in fp32, and three of them plus the weights and a
+            # readout pass are what put n=8 over a 16 GB card.
+            cache2 = build_cache(agg, images_ref)
+            query2 = run_query(agg, images_query, cache2)
+            repeat = compare_lists(query, query2)
+            del cache2, query2
+            torch.cuda.empty_cache()
+
+            with torch.inference_mode():
+                zeroed = [(torch.zeros_like(k), torch.zeros_like(v)) for k, v in cache]
+            query_zeroed = run_query(agg, images_query, zeroed)
+            control = compare_lists(query_zeroed, readout)
+            del zeroed, query_zeroed, query, readout
+            torch.cuda.empty_cache()
 
         # Timed on the GPU tensors: a device transfer is not part of what a tracker
         # would pay per frame, and it is the same for both paths anyway.
         ms_cached = time_ms(lambda: query_fwd(agg, images_query, cache), args.warmup, args.iters)
-        ms_readout = time_ms(lambda: readout_fwd(agg, images, n), args.warmup, args.iters)
-
-        ok_fidelity = fidelity[1] <= args.tol_fidelity
-        ok_control = control[0] >= args.zeroed_margin * max(fidelity[0], 1e-12)
-        if not (ok_fidelity and ok_control):
-            failures.append((name, fidelity, control, ok_fidelity, ok_control))
+        ms_readout = None if args.cache_only else time_ms(
+            lambda: readout_fwd(agg, images, n), args.warmup, args.iters)
 
         print(f"--- {name}")
-        print(f"    FIDELITY {fidelity[0]:.3e} ({fidelity[1]:.2%})   "
-              f"REPEAT {repeat[0]:.3e}   ZEROED {control[0]:.3e} ({control[1]:.2%})")
-        print(f"    cache {n_bytes / 2**20:.1f} MiB   "
-              f"cached {ms_cached:.1f} ms   readout {ms_readout:.1f} ms   "
-              f"speedup {ms_readout / ms_cached:.2f}x")
+        if args.cache_only:
+            print(f"    cache {n_bytes / 2**20:.1f} MiB   cached {ms_cached:.1f} ms   "
+                  "(readout baseline skipped)")
+        else:
+            ok_fidelity = fidelity[1] <= args.tol_fidelity
+            ok_control = control[0] >= args.zeroed_margin * max(fidelity[0], 1e-12)
+            if not (ok_fidelity and ok_control):
+                failures.append((name, fidelity, control, ok_fidelity, ok_control))
+            print(f"    FIDELITY {fidelity[0]:.3e} ({fidelity[1]:.2%})   "
+                  f"REPEAT {repeat[0]:.3e}   ZEROED {control[0]:.3e} ({control[1]:.2%})")
+            print(f"    cache {n_bytes / 2**20:.1f} MiB   "
+                  f"cached {ms_cached:.1f} ms   readout {ms_readout:.1f} ms   "
+                  f"speedup {ms_readout / ms_cached:.2f}x")
 
         records.append({
             "seq_name": name, "ids": ids,
             "fidelity": fidelity, "repeat": repeat, "zeroed": control,
             "cache_bytes": n_bytes, "ms_cached": ms_cached, "ms_readout": ms_readout,
-            "speedup": ms_readout / ms_cached,
+            "speedup": None if ms_readout is None else ms_readout / ms_cached,
         })
-        del cache, query, readout
+        del cache
         torch.cuda.empty_cache()
 
     assert records, "every sequence was skipped"
 
     summary = {
-        "fidelity_max_abs": max(r["fidelity"][0] for r in records),
-        "fidelity_max_rel": max(r["fidelity"][1] for r in records),
-        "repeat_max_abs": max(r["repeat"][0] for r in records),
-        "zeroed_min_abs": min(r["zeroed"][0] for r in records),
         "cache_bytes": records[0]["cache_bytes"],
         "ms_cached_median": float(np.median([r["ms_cached"] for r in records])),
-        "ms_readout_median": float(np.median([r["ms_readout"] for r in records])),
-        "speedup_median": float(np.median([r["speedup"] for r in records])),
     }
+    if not args.cache_only:
+        summary.update({
+            "fidelity_max_abs": max(r["fidelity"][0] for r in records),
+            "fidelity_max_rel": max(r["fidelity"][1] for r in records),
+            "repeat_max_abs": max(r["repeat"][0] for r in records),
+            "zeroed_min_abs": min(r["zeroed"][0] for r in records),
+            "ms_readout_median": float(np.median([r["ms_readout"] for r in records])),
+            "speedup_median": float(np.median([r["speedup"] for r in records])),
+        })
     result = {
         "num_ref": n, "start": args.start, "query_gap": args.query_gap,
         "query_index": args.start + q_idx, "num_seqs": len(records),
@@ -298,18 +321,25 @@ def main():
         json.dump(result, f, indent=2)
 
     print(f"\n=== summary over {len(records)} sequences, num_ref = {n} ===")
-    print(f"FIDELITY  max {summary['fidelity_max_abs']:.3e} ({summary['fidelity_max_rel']:.2%})  "
-          f"-- expected at the ~1e-6 GEMM floor, tol {args.tol_fidelity:.0e}")
-    print(f"REPEAT    max {summary['repeat_max_abs']:.3e}  -- the cached path's own floor")
-    print(f"ZEROED    min {summary['zeroed_min_abs']:.3e}  -- must be >= "
-          f"{args.zeroed_margin:g}x FIDELITY")
+    if not args.cache_only:
+        print(f"FIDELITY  max {summary['fidelity_max_abs']:.3e} ({summary['fidelity_max_rel']:.2%})  "
+              f"-- expected at the GEMM floor, tol {args.tol_fidelity:.0e} relative")
+        print(f"REPEAT    max {summary['repeat_max_abs']:.3e}  -- the cached path's own floor")
+        print(f"ZEROED    min {summary['zeroed_min_abs']:.3e}  -- must be >= "
+              f"{args.zeroed_margin:g}x FIDELITY")
     print(f"cache     {summary['cache_bytes'] / 2**20:.1f} MiB "
           f"({summary['cache_bytes'] / 2**20 / n:.1f} MiB per reference frame)")
-    print(f"time      cached {summary['ms_cached_median']:.1f} ms  vs  "
-          f"readout {summary['ms_readout_median']:.1f} ms  =  "
-          f"{summary['speedup_median']:.2f}x")
+    if args.cache_only:
+        print(f"time      cached {summary['ms_cached_median']:.1f} ms  (no baseline)")
+    else:
+        print(f"time      cached {summary['ms_cached_median']:.1f} ms  vs  "
+              f"readout {summary['ms_readout_median']:.1f} ms  =  "
+              f"{summary['speedup_median']:.2f}x")
     print(f"\nwrote {args.out}")
 
+    if args.cache_only:
+        print(f"\ncache_only: cost measured, correctness not. FIDELITY, REPEAT and ZEROED come "
+              "from the runs that keep the baseline.")
     if failures:
         print(f"\nFAILED on {len(failures)} of {len(records)} sequences:")
         for name, fid, ctl, ok_f, ok_c in failures:
