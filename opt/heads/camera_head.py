@@ -74,7 +74,8 @@ class CameraHead(nn.Module):
         self.adaln_norm = nn.LayerNorm(dim_in, elementwise_affine=False, eps=1e-6)
         self.pose_branch = Mlp(in_features=dim_in, hidden_features=dim_in // 2, out_features=self.target_dim, drop=0)
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4, num_ref_frames: int = None) -> list:
+    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4, num_ref_frames: int = None,
+                cached_pose_tokens: torch.Tensor = None, collect_pose_tokens: list = None) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -93,7 +94,24 @@ class CameraHead(nn.Module):
         pose_tokens = tokens[:, :, 0]
         pose_tokens = self.token_norm(pose_tokens)
 
+        # The trunk is one token per frame, four blocks, four refinement iterations --
+        # cheap enough that caching its K/V would be pure complexity. Cache the
+        # reference frames' TOKENS instead and re-run the gated trunk over
+        # [reference, query]: exact by construction, and it reuses the readout path
+        # that Step 0.5 already proved leaks nothing.
+        if collect_pose_tokens is not None:
+            collect_pose_tokens.append(pose_tokens)
+        if cached_pose_tokens is not None:
+            assert num_ref_frames is None, "the cache IS the reference block"
+            assert pose_tokens.shape[1] == 1, "a cached camera-head pass takes one query frame"
+            num_ref_frames = cached_pose_tokens.shape[1]
+            pose_tokens = torch.cat([cached_pose_tokens, pose_tokens], dim=1)
+
         pred_pose_enc_list = self.trunk_fn(pose_tokens, num_iterations, num_ref_frames=num_ref_frames)
+        if cached_pose_tokens is not None:
+            # Only the query frame is this pass's output; the reference rows are a
+            # by-product of running the trunk over the whole block.
+            pred_pose_enc_list = [p[:, -1:] for p in pred_pose_enc_list]
         return pred_pose_enc_list
 
     def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int, num_ref_frames: int = None) -> list:

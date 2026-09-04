@@ -572,7 +572,7 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 depth_sensor: torch.Tensor = None, category_names: list = None,
                 intrinsics: torch.Tensor = None, crop_boxes: torch.Tensor = None,
                 masks: torch.Tensor = None, use_gt_intrinsics: bool = False,
-                num_ref_frames: int = None):
+                num_ref_frames: int = None, opt_cache: dict = None, collect_cache: dict = None):
         """
         Forward pass of the OPT model.
 
@@ -659,8 +659,33 @@ class OPT(nn.Module, PyTorchModelHubMixin):
             f"got S={images.shape[1]}"
         )
 
+        # Step 1b. collect_cache: a plain forward over the reference frames that keeps
+        # what a query frame will need. opt_cache: one query frame, consuming it.
+        #
+        # Two kinds of thing go in the cache, and only one is a KV cache. The
+        # aggregator's 24 global blocks are cached as K/V because their cost grows
+        # with the reference block. The camera head's trunk is one token per frame,
+        # so its reference TOKENS are cached and the gated trunk is re-run over
+        # [reference, query] -- exact, and far less code than threading a cache
+        # through four refinement iterations.
+        #
+        # A cached pass produces pose_enc, depth and world_points for the query
+        # frame, and stops there. The NOCS branch and the pose head are skipped: in
+        # multi-view mode the pose head emits one frame-0-referenced pose for the
+        # whole set (posenet_head.py:252, housecat_default.yaml:207), so it is not a
+        # per-frame quantity and a tracker does not read it per frame. The per-frame
+        # pose is the camera head's, which is also what KV-Tracker evaluates.
+        assert opt_cache is None or collect_cache is None, "build or consume, not both"
+        if opt_cache is not None:
+            assert num_ref_frames is None, "the cache IS the reference block"
+            assert images.shape[1] == 1, f"a cached pass takes one query frame, got S={images.shape[1]}"
+        if collect_cache is not None:
+            assert num_ref_frames is None, "build the cache from a plain forward over the references"
+
         aggregated_tokens_list, patch_start_idx = self.aggregator(
-            images, masks=masks, num_ref_frames=num_ref_frames
+            images, masks=masks, num_ref_frames=num_ref_frames,
+            kv_cache=None if opt_cache is None else opt_cache["agg_kv"],
+            collect_kv=None if collect_cache is None else collect_cache.setdefault("agg_kv", []),
         )
 
         predictions = {}
@@ -668,7 +693,14 @@ class OPT(nn.Module, PyTorchModelHubMixin):
         with torch.amp.autocast("cuda", enabled=False):
             pose_enc_for_projection = None
             if self.camera_head is not None:
-                pose_enc_list = self.camera_head(aggregated_tokens_list, num_ref_frames=num_ref_frames)
+                pose_token_sink = [] if collect_cache is not None else None
+                pose_enc_list = self.camera_head(
+                    aggregated_tokens_list, num_ref_frames=num_ref_frames,
+                    cached_pose_tokens=None if opt_cache is None else opt_cache["pose_tokens"],
+                    collect_pose_tokens=pose_token_sink,
+                )
+                if pose_token_sink is not None:
+                    collect_cache["pose_tokens"] = pose_token_sink[0]
                 pose_enc_for_projection = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
                 if intrinsics is not None:
@@ -723,7 +755,7 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                     predictions['center_pm'] = center_pm.expand(-1, S_pm, -1, -1).contiguous()  # [B, S, 1, 3]
                     predictions["pts_3d_pm_c"] = predictions["pts_3d_pm"] - predictions['center_pm']
 
-            if self.nocs_head is not None:
+            if self.nocs_head is not None and opt_cache is None:
                 B, S = images.shape[:2]
                 if cat_labels is not None and len(cat_labels.shape) == 1:
                     cat_labels = cat_labels.unsqueeze(1).expand(B, S)
@@ -906,7 +938,7 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                         predictions["abs_translation"] = abs_translation_view
                         predictions["abs_size"] = abs_size_view
 
-            if self.pose_head is not None:
+            if self.pose_head is not None and opt_cache is None:
                 delta_r, delta_t, delta_s = None, None, None
                 kpt_3d_aug = kpt_3d
                 center_aug = predictions["center_pm"]

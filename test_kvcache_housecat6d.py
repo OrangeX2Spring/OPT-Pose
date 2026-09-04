@@ -132,6 +132,8 @@ import torch
 sys.path.append("opt/")
 sys.path.append("utils/")
 
+E2E_KEYS = ["pose_enc", "depth", "world_points"]
+
 from test_abs_housecat6d import load_opt_model
 from test_causal_housecat6d import build_common_conf, build_inputs, compare, select_query
 from training.data.datasets.housecat import HouseCat6DPoseDataset
@@ -186,6 +188,31 @@ def run_query(agg, images_query, cache, dtype="fp32"):
     """query_fwd on the CPU for comparison."""
     with torch.inference_mode():
         return [t.float().cpu() for t in query_fwd(agg, images_query, cache, dtype)]
+
+
+def slice_frames(inp: dict, sl: slice) -> dict:
+    """Reindex only the entries carrying a frame axis; cat_labels is [B] and the
+    intrinsics flag is a bool."""
+    return {k: (v[:, sl] if torch.is_tensor(v) and v.dim() >= 2 and v.shape[1] > 1 else v)
+            for k, v in inp.items()}
+
+
+def model_fwd(model, inp, seed, dtype="fp32", num_ref_frames=None, opt_cache=None, collect_cache=None):
+    """One full-model forward. Step 1b: the end-to-end path, not just the aggregator."""
+    np.random.seed(seed)
+    with torch.inference_mode(), amp_ctx(dtype):
+        return model(
+            images=inp["images"], cat_labels=inp["cat_labels"],
+            choose_indices=inp["choose_indices"], nocs_gt=inp["nocs_gt"],
+            depth_sensor=inp["depth_sensor"], intrinsics=inp["intrinsics"],
+            use_gt_intrinsics=inp["use_gt_intrinsics"], num_ref_frames=num_ref_frames,
+            opt_cache=opt_cache, collect_cache=collect_cache,
+        )
+
+
+def keep_e2e(preds, frame_slice):
+    with torch.inference_mode():
+        return [preds[k][:, frame_slice].float().cpu() for k in E2E_KEYS]
 
 
 def compare_lists(left, right):
@@ -247,6 +274,13 @@ def main():
                         help="the zeroed-cache control must be at least this many times worse "
                              "than FIDELITY, or the cache is not being read")
     parser.add_argument("--seed", type=int, default=0, help="numpy seed, set before every pass")
+    parser.add_argument("--end_to_end", action="store_true",
+                        help="Step 1b: cache the whole model, not just the aggregator, and "
+                             "compare pose_enc, depth and world_points on the query frame. The "
+                             "cached pass skips the NOCS branch and the pose head -- in "
+                             "multi-view mode the pose head emits one frame-0-referenced pose "
+                             "for the set, so it is not a per-frame quantity; the per-frame pose "
+                             "is the camera head's, which is what a tracker reads")
     parser.add_argument("--cache_only", action="store_true",
                         help="skip the readout baseline, FIDELITY, REPEAT and ZEROED; measure "
                              "only what the cached path costs. For the large-n cost curve, "
@@ -307,9 +341,15 @@ def main():
         images = readout_inp["images"]
         images_ref, images_query = images[:, :n], images[:, n : n + 1]
 
-        np.random.seed(args.seed)
         torch.cuda.reset_peak_memory_stats()
-        cache = build_cache(agg, images_ref, args.dtype)
+        if args.end_to_end:
+            inp_ref, inp_qry = slice_frames(readout_inp, slice(0, n)), slice_frames(readout_inp, slice(n, n + 1))
+            e2e_cache = {}
+            model_fwd(model, inp_ref, args.seed, args.dtype, collect_cache=e2e_cache)
+            cache = e2e_cache["agg_kv"]
+        else:
+            np.random.seed(args.seed)
+            cache = build_cache(agg, images_ref, args.dtype)
         assert len(cache) == len(agg.global_blocks)
         n_bytes = cache_bytes(cache)
         peak_build = torch.cuda.max_memory_allocated()
@@ -319,7 +359,20 @@ def main():
         resident = torch.cuda.memory_allocated()
 
         fidelity = repeat = control = precision = None
-        if not args.cache_only:
+        if args.end_to_end:
+            query = keep_e2e(model_fwd(model, inp_qry, args.seed, args.dtype, opt_cache=e2e_cache),
+                             slice(0, 1))
+            readout = keep_e2e(model_fwd(model, readout_inp, args.seed, args.dtype, num_ref_frames=n),
+                               slice(n, n + 1))
+            fidelity = compare_lists(query, readout)
+            repeat = (0.0, 0.0)
+            control = compare_lists(query, keep_e2e(
+                model_fwd(model, inp_qry, args.seed, args.dtype,
+                          opt_cache={"agg_kv": [(torch.zeros_like(k), torch.zeros_like(v))
+                                                for k, v in e2e_cache["agg_kv"]],
+                                     "pose_tokens": torch.zeros_like(e2e_cache["pose_tokens"])}),
+                slice(0, 1)))
+        elif not args.cache_only:
             query = run_query(agg, images_query, cache, args.dtype)
 
             np.random.seed(args.seed)
@@ -357,10 +410,18 @@ def main():
 
         # Timed on the GPU tensors: a device transfer is not part of what a tracker
         # would pay per frame, and it is the same for both paths anyway.
-        ms_cached = time_ms(lambda: query_fwd(agg, images_query, cache, args.dtype),
-                            args.warmup, args.iters)
-        ms_readout = None if args.cache_only else time_ms(
-            lambda: readout_fwd(agg, images, n, args.dtype), args.warmup, args.iters)
+        if args.end_to_end:
+            ms_cached = time_ms(
+                lambda: model_fwd(model, inp_qry, args.seed, args.dtype, opt_cache=e2e_cache),
+                args.warmup, args.iters)
+            ms_readout = time_ms(
+                lambda: model_fwd(model, readout_inp, args.seed, args.dtype, num_ref_frames=n),
+                args.warmup, args.iters)
+        else:
+            ms_cached = time_ms(lambda: query_fwd(agg, images_query, cache, args.dtype),
+                                args.warmup, args.iters)
+            ms_readout = None if args.cache_only else time_ms(
+                lambda: readout_fwd(agg, images, n, args.dtype), args.warmup, args.iters)
 
         print(f"--- {name}")
         print(f"    cache {n_bytes / 2**20:.1f} MiB claimed   {resident / 2**20:.1f} MiB "
@@ -391,6 +452,8 @@ def main():
             "speedup": None if ms_readout is None else ms_readout / ms_cached,
         })
         del cache
+        if args.end_to_end:
+            del e2e_cache, inp_ref, inp_qry, query, readout
         torch.cuda.empty_cache()
 
     assert records, "every sequence was skipped"
