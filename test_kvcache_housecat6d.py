@@ -338,8 +338,9 @@ def main():
     print(f"\nwrote {args.out}")
 
     if args.cache_only:
-        print(f"\ncache_only: cost measured, correctness not. FIDELITY, REPEAT and ZEROED come "
-              "from the runs that keep the baseline.")
+        print("\ncache_only: cost measured, correctness NOT. FIDELITY, REPEAT and ZEROED come "
+              "from the runs that keep the baseline; this run made no claim about them.")
+        return
     if failures:
         print(f"\nFAILED on {len(failures)} of {len(records)} sequences:")
         for name, fid, ctl, ok_f, ok_c in failures:

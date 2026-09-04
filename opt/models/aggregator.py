@@ -241,6 +241,13 @@ class Aggregator(nn.Module):
                 Frame attention is untouched; it is per-frame already. Inference only.
             collect_kv (list, optional): appended with one (k, v) per global block, in
                 block order. Run this over the reference frames alone to build a cache.
+                A cache build returns an EMPTY output list. The intermediates are what
+                a forward is read for, and this forward is not read -- it is run to
+                capture k/v. They are not free: each of the 48 blocks retains a view of
+                its output, and the 24 concatenations that follow are [B, S, P, 2C]
+                each, together about 540 MB per reference frame in fp32. That is more
+                than the 258 MB/frame the cache itself costs, and holding it is what
+                put n=16 over a 16 GB card. A tracker's mapping phase reads none of it.
             kv_cache (list, optional): a cache from collect_kv. `images` is then the
                 query frame ALONE (S=1) and the reference block is never recomputed --
                 the same arithmetic num_ref_frames performs, minus the recomputation.
@@ -340,6 +347,10 @@ class Aggregator(nn.Module):
         # the reference block is simply the first num_ref_frames * P tokens.
         num_ref_tokens = None if num_ref_frames is None else num_ref_frames * P
 
+        # A cache build is run for its k/v, not for its outputs. Keeping the
+        # intermediates would cost more memory than the cache does; see the docstring.
+        keep_intermediates = collect_kv is None
+
         frame_idx = 0
         global_idx = 0
         output_list = []
@@ -348,12 +359,14 @@ class Aggregator(nn.Module):
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
-                        tokens, B, S, P, C, frame_idx, pos=pos
+                        tokens, B, S, P, C, frame_idx, pos=pos,
+                        keep_intermediates=keep_intermediates,
                     )
                 elif attn_type == "global":
                     tokens, global_idx, global_intermediates = self._process_global_attention(
                         tokens, B, S, P, C, global_idx, pos=pos, num_ref_tokens=num_ref_tokens,
                         kv_cache=kv_cache, collect_kv=collect_kv,
+                        keep_intermediates=keep_intermediates,
                     )
                 else:
                     raise ValueError(f"Unknown attention type: {attn_type}")
@@ -362,13 +375,14 @@ class Aggregator(nn.Module):
                 # concat frame and global intermediates, [B x S x P x 2C]
                 concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
                 output_list.append(concat_inter)
+                del concat_inter
 
-        del concat_inter
         del frame_intermediates
         del global_intermediates
         return output_list, self.patch_start_idx
 
-    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None):
+    def _process_frame_attention(self, tokens, B, S, P, C, frame_idx, pos=None,
+                                 keep_intermediates=True):
         """
         Process frame attention blocks. We keep tokens in shape (B*S, P, C).
         """
@@ -388,12 +402,14 @@ class Aggregator(nn.Module):
             else:
                 tokens = self.frame_blocks[frame_idx](tokens, pos=pos)
             frame_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            # A view, not a copy: appending it keeps this block's output alive.
+            if keep_intermediates:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, frame_idx, intermediates
 
     def _process_global_attention(self, tokens, B, S, P, C, global_idx, pos=None, num_ref_tokens=None,
-                                  kv_cache=None, collect_kv=None):
+                                  kv_cache=None, collect_kv=None, keep_intermediates=True):
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
         """
@@ -419,7 +435,8 @@ class Aggregator(nn.Module):
                     collect_kv=collect_kv,
                 )
             global_idx += 1
-            intermediates.append(tokens.view(B, S, P, C))
+            if keep_intermediates:
+                intermediates.append(tokens.view(B, S, P, C))
 
         return tokens, global_idx, intermediates
 
