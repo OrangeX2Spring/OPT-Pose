@@ -47,6 +47,13 @@ Step 0 a session. What is gated instead:
   REPEAT    QUERY vs a second BUILD+QUERY on freshly built tensors. The floor of
             the cached path itself. The aggregator has no sonata in it, so this
             should be exactly 0.
+Peak GPU memory is reported per cell, from torch.cuda.max_memory_allocated. It is
+not the quantity jobstats reports -- it excludes the allocator's reserved slack
+and the CUDA context -- but it is the right instrument HERE, because what is
+being checked is whether the cache costs what its own numel says it costs. It did
+not, for four runs: k and v came back as views into a fused qkv projection, so
+the pair pinned twice what it accounted for.
+
   ZEROED    QUERY with a zeroed cache, against READOUT. A negative control: if
             this is not orders WORSE than FIDELITY, the cache is not being read
             and FIDELITY proves nothing. Step 0 shipped two controls that could
@@ -236,9 +243,15 @@ def main():
         images_ref, images_query = images[:, :n], images[:, n : n + 1]
 
         np.random.seed(args.seed)
+        torch.cuda.reset_peak_memory_stats()
         cache = build_cache(agg, images_ref)
         assert len(cache) == len(agg.global_blocks)
         n_bytes = cache_bytes(cache)
+        peak_build = torch.cuda.max_memory_allocated()
+        # What the cache's own numel claims, against what is actually resident once the
+        # build's transients are gone. They agree only if nothing in the cache is a view
+        # into a larger allocation.
+        resident = torch.cuda.memory_allocated()
 
         fidelity = repeat = control = None
         if not args.cache_only:
@@ -272,9 +285,10 @@ def main():
             lambda: readout_fwd(agg, images, n), args.warmup, args.iters)
 
         print(f"--- {name}")
+        print(f"    cache {n_bytes / 2**20:.1f} MiB claimed   {resident / 2**20:.1f} MiB "
+              f"resident after build   peak {peak_build / 2**20:.1f} MiB")
         if args.cache_only:
-            print(f"    cache {n_bytes / 2**20:.1f} MiB   cached {ms_cached:.1f} ms   "
-                  "(readout baseline skipped)")
+            print(f"    cached {ms_cached:.1f} ms   (readout baseline skipped)")
         else:
             ok_fidelity = fidelity[1] <= args.tol_fidelity
             ok_control = control[0] >= args.zeroed_margin * max(fidelity[0], 1e-12)
@@ -282,14 +296,15 @@ def main():
                 failures.append((name, fidelity, control, ok_fidelity, ok_control))
             print(f"    FIDELITY {fidelity[0]:.3e} ({fidelity[1]:.2%})   "
                   f"REPEAT {repeat[0]:.3e}   ZEROED {control[0]:.3e} ({control[1]:.2%})")
-            print(f"    cache {n_bytes / 2**20:.1f} MiB   "
-                  f"cached {ms_cached:.1f} ms   readout {ms_readout:.1f} ms   "
+            print(f"    cached {ms_cached:.1f} ms   readout {ms_readout:.1f} ms   "
                   f"speedup {ms_readout / ms_cached:.2f}x")
 
         records.append({
             "seq_name": name, "ids": ids,
             "fidelity": fidelity, "repeat": repeat, "zeroed": control,
-            "cache_bytes": n_bytes, "ms_cached": ms_cached, "ms_readout": ms_readout,
+            "cache_bytes": n_bytes, "peak_build_bytes": peak_build,
+            "resident_after_build_bytes": resident,
+            "ms_cached": ms_cached, "ms_readout": ms_readout,
             "speedup": None if ms_readout is None else ms_readout / ms_cached,
         })
         del cache
@@ -299,6 +314,8 @@ def main():
 
     summary = {
         "cache_bytes": records[0]["cache_bytes"],
+        "peak_build_bytes": max(r["peak_build_bytes"] for r in records),
+        "resident_after_build_bytes": max(r["resident_after_build_bytes"] for r in records),
         "ms_cached_median": float(np.median([r["ms_cached"] for r in records])),
     }
     if not args.cache_only:
@@ -327,8 +344,12 @@ def main():
         print(f"REPEAT    max {summary['repeat_max_abs']:.3e}  -- the cached path's own floor")
         print(f"ZEROED    min {summary['zeroed_min_abs']:.3e}  -- must be >= "
               f"{args.zeroed_margin:g}x FIDELITY")
-    print(f"cache     {summary['cache_bytes'] / 2**20:.1f} MiB "
+    print(f"cache     {summary['cache_bytes'] / 2**20:.1f} MiB claimed "
           f"({summary['cache_bytes'] / 2**20 / n:.1f} MiB per reference frame)")
+    print(f"memory    {summary['resident_after_build_bytes'] / 2**20:.1f} MiB resident "
+          f"after build, peak {summary['peak_build_bytes'] / 2**20:.1f} MiB. Resident "
+          "minus weights should equal the claim; double it and something in the cache "
+          "is a view into a larger allocation.")
     if args.cache_only:
         print(f"time      cached {summary['ms_cached_median']:.1f} ms  (no baseline)")
     else:

@@ -92,7 +92,13 @@ class Attention(nn.Module):
         if collect_kv is not None:
             assert not self.training, "collect_kv is an inference-only cache build"
             assert kv_cache is None, "collect_kv builds a cache; kv_cache consumes one"
-            collect_kv.append((k, v))
+            # clone(), and it is not defensive. q, k and v are unbind() views into ONE
+            # fused [3, B, H, N, D] projection, and RoPE happens to rebuild k but not v
+            # -- so storing the pair as returned pins the whole qkv allocation, q
+            # included: four units per block where the cache needs two. Exactly 2x, and
+            # invisible to any accounting that sums k.numel() and v.numel(), which is
+            # what made a 32-frame cache report 8.05 GiB while allocating 16.1.
+            collect_kv.append((k.clone(), v.clone()))
 
         if kv_cache is not None:
             assert not self.training, "kv_cache is an inference-only readout"
