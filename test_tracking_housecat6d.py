@@ -9,7 +9,6 @@ import hashlib
 import json
 from pathlib import Path
 import resource
-import subprocess
 import time
 
 import numpy as np
@@ -79,6 +78,7 @@ def differences(left, right):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--method", choices=("prepare", "verify", "cached", "original", "readout"), required=True)
+    p.add_argument("--opt_commit", required=True, help="Model commit recorded by the host launcher")
     p.add_argument("--run", type=Path, required=True)
     p.add_argument("--data_root", default="/tmp/data/housecat6d")
     p.add_argument("--checkpoint", default="/mnt/projects/gr/3DRecon/opt_pose_ckpt/abs_pose_housecat.pt")
@@ -140,7 +140,7 @@ def main():
                 ckpt_hash.update(chunk)
         manifest = {"arguments": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                     "sequences": sequences, "checkpoint_sha256": ckpt_hash.hexdigest(),
-                    "opt_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+                    "opt_commit": args.opt_commit,
                     "torch": torch.__version__, "cuda": torch.version.cuda,
                     "gpu": torch.cuda.get_device_name(), "protocol": "fixed references; no query insertion; no ground-truth accuracy claim"}
         manifest_path.write_text(json.dumps(manifest, indent=2))
