@@ -197,7 +197,7 @@ def load_opt_model(checkpoint_path: str, device: str = "cuda"):
 
     print(f"Using device: {device}")
     print(f"Loading checkpoint: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
 
     if isinstance(ckpt, dict):
         state_dict = ckpt.get("state_dict", ckpt)
@@ -219,6 +219,7 @@ def load_opt_model(checkpoint_path: str, device: str = "cuda"):
             "Please use the matching OPT checkpoint."
         )
 
+    del state_dict, ckpt  # Release checkpoint storage before moving model weights to CUDA.
     model.eval()
     model = model.to(device)
     print("Model loaded")

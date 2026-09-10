@@ -572,7 +572,8 @@ class OPT(nn.Module, PyTorchModelHubMixin):
                 depth_sensor: torch.Tensor = None, category_names: list = None,
                 intrinsics: torch.Tensor = None, crop_boxes: torch.Tensor = None,
                 masks: torch.Tensor = None, use_gt_intrinsics: bool = False,
-                num_ref_frames: int = None, opt_cache: dict = None, collect_cache: dict = None):
+                num_ref_frames: int = None, opt_cache: dict = None, collect_cache: dict = None,
+                tracking_mode: str = None):
         """
         Forward pass of the OPT model.
 
@@ -659,33 +660,16 @@ class OPT(nn.Module, PyTorchModelHubMixin):
             f"got S={images.shape[1]}"
         )
 
-        # Step 1b. collect_cache: a plain forward over the reference frames that keeps
-        # what a query frame will need. opt_cache: one query frame, consuming it.
-        #
-        # Two kinds of thing go in the cache, and only one is a KV cache. The
-        # aggregator's 24 global blocks are cached as K/V because their cost grows
-        # with the reference block. The camera head's trunk is one token per frame,
-        # so its reference TOKENS are cached and the gated trunk is re-run over
-        # [reference, query] -- exact, and far less code than threading a cache
-        # through four refinement iterations.
-        #
-        # A cached pass produces pose_enc, depth and world_points for the query
-        # frame, and stops there. The NOCS branch and the pose head are skipped: in
-        # multi-view mode the pose head emits one frame-0-referenced pose for the
-        # whole set (posenet_head.py:252, housecat_default.yaml:207), so it is not a
-        # per-frame quantity and a tracker does not read it per frame. The per-frame
-        # pose is the camera head's, which is also what KV-Tracker evaluates.
-        assert opt_cache is None or collect_cache is None, "build or consume, not both"
-        if opt_cache is not None:
-            assert num_ref_frames is None, "the cache IS the reference block"
-            assert images.shape[1] == 1, f"a cached pass takes one query frame, got S={images.shape[1]}"
-        if collect_cache is not None:
-            assert num_ref_frames is None, "build the cache from a plain forward over the references"
+        if tracking_mode is not None or opt_cache is not None or collect_cache is not None:
+            return self.forward_tracking(
+                images, mode=tracking_mode or "geometry", masks=masks,
+                num_ref_frames=num_ref_frames, opt_cache=opt_cache,
+                collect_cache=collect_cache, intrinsics=intrinsics,
+                use_gt_intrinsics=use_gt_intrinsics,
+            )
 
         aggregated_tokens_list, patch_start_idx = self.aggregator(
             images, masks=masks, num_ref_frames=num_ref_frames,
-            kv_cache=None if opt_cache is None else opt_cache["agg_kv"],
-            collect_kv=None if collect_cache is None else collect_cache.setdefault("agg_kv", []),
         )
 
         predictions = {}
@@ -693,14 +677,9 @@ class OPT(nn.Module, PyTorchModelHubMixin):
         with torch.amp.autocast("cuda", enabled=False):
             pose_enc_for_projection = None
             if self.camera_head is not None:
-                pose_token_sink = [] if collect_cache is not None else None
                 pose_enc_list = self.camera_head(
                     aggregated_tokens_list, num_ref_frames=num_ref_frames,
-                    cached_pose_tokens=None if opt_cache is None else opt_cache["pose_tokens"],
-                    collect_pose_tokens=pose_token_sink,
                 )
-                if pose_token_sink is not None:
-                    collect_cache["pose_tokens"] = pose_token_sink[0]
                 pose_enc_for_projection = pose_enc_list[-1]  # pose encoding of the last iteration
                 predictions["pose_enc_list"] = pose_enc_list
                 if intrinsics is not None:
@@ -1051,6 +1030,58 @@ class OPT(nn.Module, PyTorchModelHubMixin):
 
         return predictions
     
+    def forward_tracking(self, images, mode="camera", masks=None, num_ref_frames=None,
+                         opt_cache=None, collect_cache=None, intrinsics=None,
+                         use_gt_intrinsics=False):
+        """Inference-only, matched-output bidirectional/readout/cached camera tracking.
+
+        Build retains only global K/V and normalized reference camera tokens. It
+        never decodes reference maps or runs Sonata/NOCS/object pose. Geometry
+        queries retain just the DPT layers; camera queries retain one camera token.
+        Cache contents are immutable between builds. The caller bounds keyframes.
+        """
+        assert not self.training and not torch.is_grad_enabled()
+        assert images.ndim == 5 and images.shape[2] == 3
+        assert mode in ("camera", "geometry")
+        assert opt_cache is None or collect_cache is None
+        if opt_cache is not None:
+            assert images.shape[1] == 1 and num_ref_frames is None
+        if collect_cache is not None:
+            assert not collect_cache and num_ref_frames is None
+        last = len(self.aggregator.global_blocks) - 1
+        indices = {last}
+        camera_only = mode == "camera" or collect_cache is not None
+        if not camera_only:
+            indices.update(self.depth_head.intermediate_layer_idx)
+            indices.update(self.point_head.intermediate_layer_idx)
+        tokens, patch_start = self.aggregator(
+            images, masks=masks, num_ref_frames=num_ref_frames,
+            kv_cache=None if opt_cache is None else opt_cache["agg_kv"],
+            collect_kv=None if collect_cache is None else collect_cache.setdefault("agg_kv", []),
+            output_indices=sorted(indices), camera_tokens_only=camera_only,
+        )
+        # Match the original forward's fp32 heads, including normalization before
+        # caching. Do not retain a view of the full final patch-token allocation.
+        with torch.amp.autocast("cuda", enabled=False):
+            if collect_cache is not None:
+                collect_cache["pose_tokens"] = self.camera_head.token_norm(tokens[-1][:, :, 0]).clone()
+                return {}
+            poses = self.camera_head(
+                tokens, num_ref_frames=num_ref_frames,
+                cached_pose_tokens=None if opt_cache is None else opt_cache["pose_tokens"],
+            )[-1]
+            if use_gt_intrinsics:
+                assert intrinsics is not None
+                poses = poses.clone()
+                poses[..., 7:9] = self._intrinsics_matrix_to_enc(intrinsics, images.shape[-2:])
+            predictions = {"pose_enc": poses}
+            if mode == "geometry":
+                predictions["depth"], predictions["depth_conf"] = self.depth_head(
+                    tokens, images=images, patch_start_idx=patch_start)
+                predictions["world_points"], predictions["world_points_conf"] = self.point_head(
+                    tokens, images=images, patch_start_idx=patch_start)
+        return predictions
+
     def _intrinsics_enc_to_matrix(self, intrinsics_enc, image_size_hw):
         """
         Convert intrinsics encoding (FoV) to intrinsics matrix.

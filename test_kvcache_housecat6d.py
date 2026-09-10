@@ -3,8 +3,8 @@
 # See LICENSE and NOTICE for details. Third-party notices remain applicable.
 
 """
-Step 1a of the causal-readout line: a real KV cache for the aggregator's global
-attention, and what it costs and saves.
+Historical Step 1a aggregator benchmark. The old --end_to_end mode is retired;
+use test_tracking_housecat6d.py and tools/OPT_TRACKING.md for the full model.
 
 Step 0.5 established that a training-free causal readout does not break the
 geometry heads. It is not, however, faster: it recomputes the reference block on
@@ -67,8 +67,8 @@ runs are leaving throughput on the table. Three settings:
   tf32   two backend flags. Ampere+ only, 10-bit mantissa, tensors stay fp32 --
          so it changes speed and not one byte of memory.
   bf16   autocast. Weights stay fp32 and the norms with them; what changes is the
-         matmuls and, because the cache IS a pair of projections, the cache: 128.8
-         MiB per reference frame instead of 257.6. That is the difference between
+         matmuls and, because the cache IS a pair of projections, the cache: 193.2
+         MiB per reference frame instead of 257.6 (K remains fp32). That is the difference between
          a 70-frame cache fitting a 24 GB card and not. The checkpoint was trained
          in bf16 (housecat_default.yaml:250), so this is arguably the faithful
          setting and fp32 the deviation.
@@ -263,7 +263,7 @@ def main():
     parser.add_argument("--dtype", choices=("fp32", "tf32", "bf16"), default="fp32",
                         help="fp32 as shipped; tf32 flips the two Ampere backend flags "
                              "(torch 2.x defaults them off, tensors stay fp32); bf16 "
-                             "autocasts, which also halves the cache. sm_80+ for both")
+                             "autocasts, reducing the measured cache to 193.2 MiB/frame. sm_80+ for both")
     parser.add_argument("--tol_fidelity", type=float, default=None,
                         help="absolute floor on the RELATIVE difference between the cached query "
                              "pass and the readout, used only in fp32. At any other dtype the gate "
@@ -290,6 +290,9 @@ def main():
     parser.add_argument("--use_gt_intrinsics", action="store_true")
     parser.add_argument("--out", type=str, required=True, help="results json")
     args = parser.parse_args()
+    if args.end_to_end:
+        parser.error("The old end-to-end harness is retired; use tools/opt_pose_tracking.sh "
+                     "for isolated baselines, real repeat controls and streamed queries.")
 
     assert args.query_gap >= 1, "--query_gap 1 is the adjacent case; 0 would query a reference frame"
     if args.tol_fidelity is None:

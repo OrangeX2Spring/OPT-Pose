@@ -229,11 +229,19 @@ class Aggregator(nn.Module):
         num_ref_frames: Optional[int] = None,
         kv_cache: Optional[List] = None,
         collect_kv: Optional[List] = None,
+        output_indices: Optional[List[int]] = None,
+        camera_tokens_only: bool = False,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
             images (torch.Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
                 B: batch size, S: sequence length, 3: RGB channels, H: height, W: width
+            output_indices: Inference-only selection of retained layer outputs.
+                Unselected entries are None, preserving DPT layer indexing. Explicit
+                selection also works during a cache build; the default still keeps
+                no outputs when collect_kv is supplied.
+            camera_tokens_only: Retain only token 0 at selected layers, copying it
+                into a compact concatenation rather than pinning all patch tokens.
             num_ref_frames (int, optional): If set, global attention becomes a causal
                 readout: frames [0, num_ref_frames) form the reference (cache) block and
                 do not see the query frame, while the query frame attends to everything.
@@ -264,6 +272,10 @@ class Aggregator(nn.Module):
                 and the patch_start_idx indicating where patch tokens begin.
         """
         B, S, C_in, H, W = images.shape
+        if output_indices is not None:
+            assert not self.training and self.aa_block_size == 1
+            assert all(0 <= i < self.depth for i in output_indices)
+        assert not camera_tokens_only or output_indices is not None
 
         if C_in != 3:
             raise ValueError(f"Expected 3 input channels, got {C_in}")
@@ -355,7 +367,9 @@ class Aggregator(nn.Module):
         global_idx = 0
         output_list = []
 
-        for _ in range(self.aa_block_num):
+        for block_index in range(self.aa_block_num):
+            if output_indices is not None:
+                keep_intermediates = block_index in output_indices
             for attn_type in self.aa_order:
                 if attn_type == "frame":
                     tokens, frame_idx, frame_intermediates = self._process_frame_attention(
@@ -373,9 +387,14 @@ class Aggregator(nn.Module):
 
             for i in range(len(frame_intermediates)):
                 # concat frame and global intermediates, [B x S x P x 2C]
-                concat_inter = torch.cat([frame_intermediates[i], global_intermediates[i]], dim=-1)
+                frame_inter, global_inter = frame_intermediates[i], global_intermediates[i]
+                if camera_tokens_only:
+                    frame_inter, global_inter = frame_inter[:, :, :1], global_inter[:, :, :1]
+                concat_inter = torch.cat([frame_inter, global_inter], dim=-1)
                 output_list.append(concat_inter)
                 del concat_inter
+            if output_indices is not None and not keep_intermediates:
+                output_list.append(None)  # Preserve the heads' layer indices.
 
         del frame_intermediates
         del global_intermediates
