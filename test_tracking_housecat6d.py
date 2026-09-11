@@ -75,6 +75,34 @@ def differences(left, right):
     return result
 
 
+def viewpoint_arc(entries, run):
+    """Max pairwise angle between view directions, in degrees.
+
+    HouseCat6D annotations are object-centred, so the camera centre -R.T @ t read
+    off source_extrinsics is already a direction from the object. This is the same
+    quantity tools/kvt_run.sh scan --arc-only reports for the KV-Tracker line.
+    """
+    groups = {"references": [], "queries": []}
+    for entry in entries:
+        with np.load(run / entry["input"]) as data:
+            extrinsics = data["source_extrinsics"].astype(np.float64)
+        key = "references" if entry["input"].endswith("references.npz") else "queries"
+        for e in extrinsics:
+            u, _, vt = np.linalg.svd(e[:3, :3])
+            sign = np.ones(3)
+            sign[-1] = np.linalg.det(u @ vt)
+            rotation = ((u * sign) @ vt).T
+            groups[key].append(-(rotation @ e[:3, 3]))
+    groups["all"] = groups["references"] + groups["queries"]
+    out = {}
+    for key, points in groups.items():
+        directions = np.stack(points)
+        directions = directions / np.linalg.norm(directions, axis=1, keepdims=True)
+        cosine = np.clip(directions @ directions.T, -1, 1)
+        out[key] = float(np.degrees(np.arccos(cosine)).max())
+    return out
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--method", choices=("prepare", "verify", "cached", "original", "readout"), required=True)
@@ -89,12 +117,19 @@ def main():
     p.add_argument("--queries", type=int, default=50)
     p.add_argument("--start", type=int, default=0)
     p.add_argument("--stride", type=int, default=1)
+    # References were consecutive, so a 3-frame cache held one viewpoint sampled
+    # three times (0.36 deg apart on bottle-v8_small). Spread them over real baseline.
+    p.add_argument("--ref_stride", type=int, default=1)
+    # Sequences were taken in sorted order, which always yielded bottle-v8_small.
+    # Name them explicitly to choose an object by its viewpoint arc instead.
+    p.add_argument("--seq_names", nargs="*", default=None)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tol", type=float, default=1e-4)
     args = p.parse_args()
     assert 1 <= args.num_ref <= 3, "This tracking protocol keeps references + query within the trained four-view window"
     assert args.num_seqs > 0 and args.queries > 0 and args.stride > 0 and args.start >= 0
+    assert args.ref_stride > 0
     assert args.warmup >= 0 and args.tol > 0
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -106,10 +141,15 @@ def main():
         args.run.mkdir(parents=True, exist_ok=False)
         ds = HouseCat6DPoseDataset(build_common_conf(518, 14), data_root=args.data_root,
                                   split="test", min_num_images=args.num_ref + 1, sample_num=1024)
-        refs = list(range(args.start, args.start + args.num_ref))
+        refs = list(range(args.start, args.start + args.num_ref * args.ref_stride, args.ref_stride))
         queries = list(range(refs[-1] + 1, refs[-1] + 1 + args.queries * args.stride, args.stride))
         sequences = []
-        for name in sorted(ds.seq_names):
+        names = sorted(ds.seq_names)
+        if args.seq_names:
+            unknown = [n for n in args.seq_names if n not in names]
+            assert not unknown, f"Unknown sequences {unknown}; available: {names}"
+            names = list(args.seq_names)
+        for name in names:
             if len(ds.chunks[name]) <= queries[-1]:
                 continue
             seqdir = args.run / f"seq{len(sequences):03d}"
@@ -130,7 +170,15 @@ def main():
                                 "source_paths": batch["filepaths"],
                                 "sha256": hashlib.sha256(target.read_bytes()).hexdigest()})
                 del batch, inp, arrays
-            sequences.append({"name": name, "directory": seqdir.name, "frames": entries})
+            # Report the viewpoint spread. Nothing printed this before, and a clip
+            # whose cache holds one viewpoint will pass every fidelity gate while
+            # measuring nothing: bottle-v8_small ran with references 0.36 deg apart.
+            arc = viewpoint_arc(entries, args.run)
+            print(f"ARC {name}: references {arc['references']:.2f} deg, "
+                  f"queries {arc['queries']:.2f} deg, references+queries {arc['all']:.2f} deg",
+                  flush=True)
+            sequences.append({"name": name, "directory": seqdir.name,
+                              "viewpoint_arc_deg": arc, "frames": entries})
             if len(sequences) == args.num_seqs:
                 break
         assert len(sequences) == args.num_seqs, "Not enough sequences long enough for the requested clip"
