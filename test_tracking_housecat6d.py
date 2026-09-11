@@ -219,11 +219,19 @@ def main():
             # Matched original and readout baselines first, with no live cache.
             original = cpu_predictions(invoke(model, combined, args, method="original"))
             readout = cpu_predictions(invoke(model, combined, args, method="readout"))
-            # Verify output-retention/head-path changes against the pre-existing full forward.
-            legacy_input = dict(combined, use_gt_intrinsics=False)
+            # Retention compares forward_tracking's ordinary path against the STOCK
+            # forward. That stock path runs the NOCS/DPT branch over every frame and
+            # allocates ~6.4 GiB at 25 frames, so it OOMs on 24 GB past ~12 references.
+            # The claim it supports -- that the refactor left the ordinary path
+            # unchanged -- needs one reference, not the whole set, so pin it to a pair
+            # and keep the check's cost independent of num_ref.
+            pair = {k: torch.cat([ref[k][:, -1:], q[k]], dim=1) if k != "cat_labels" else ref[k]
+                    for k in ref}
+            retention_base = cpu_predictions(invoke(model, pair, args, method="original"))
+            legacy_input = dict(pair, use_gt_intrinsics=False)
             legacy_preds = model_fwd(model, legacy_input, args.seed, args.dtype)
-            legacy = cpu_predictions({k: legacy_preds[k] for k in original})
-            del legacy_preds
+            legacy = cpu_predictions({k: legacy_preds[k] for k in retention_base})
+            del legacy_preds, pair
             precision = {k: {"max_rel": 0.0} for k in original}
             if args.dtype != "fp32":
                 set_precision("fp32")
@@ -252,7 +260,7 @@ def main():
             zeroed = cpu_predictions(invoke(model, q, args, cache=cache, method="cached"))
             del cache, q
             fidelity = differences(cached, readout)
-            retention = differences(original, legacy)
+            retention = differences(retention_base, legacy)
             repeat_diff = differences(cached, repeat)
             control = differences(zeroed, readout)
             floors = {k: max(args.tol, precision[k]["max_rel"]) for k in original}
