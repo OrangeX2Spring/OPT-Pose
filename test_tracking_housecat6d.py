@@ -127,7 +127,13 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--tol", type=float, default=1e-4)
     args = p.parse_args()
-    assert 1 <= args.num_ref <= 3, "This tracking protocol keeps references + query within the trained four-view window"
+    # 3 was the in-distribution cap: OPT trained on img_nums [2, 4], so references +
+    # query <= 4 is all the checkpoint has seen. Nothing in the model enforces it --
+    # the aggregator has no temporal position encoding, so frames are a set -- and
+    # Step 1a measured a 48-reference ceiling on 24 GB. Larger caches are an
+    # experiment, not a default: query cost grows ~8.5 ms per reference at bf16, so
+    # the speedup falls to ~1.2x at 24 references and inverts past ~40.
+    assert 1 <= args.num_ref <= 48, "Step 1a measured a 48-reference ceiling on 24 GB"
     assert args.num_seqs > 0 and args.queries > 0 and args.stride > 0 and args.start >= 0
     assert args.ref_stride > 0
     assert args.warmup >= 0 and args.tol > 0
